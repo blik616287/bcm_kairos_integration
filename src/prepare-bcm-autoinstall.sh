@@ -255,37 +255,61 @@ fi
 
 # ---- Post-install: fix interface naming in GRUB ----
 echo "[..] Fixing network interface naming in GRUB..."
+echo "[..] Block devices:"
+lsblk 2>/dev/null || true
+
+# Activate LVM if available
+vgchange -ay 2>/dev/null || true
+sleep 1
+
 INSTALLED_ROOT=""
-for part in /dev/vda2 /dev/vda1 /dev/sda2 /dev/sda1; do
-    if [ -b "\$part" ]; then
-        mkdir -p /mnt/installed
-        if mount "\$part" /mnt/installed 2>/dev/null; then
-            if [ -f /mnt/installed/etc/default/grub ]; then
-                INSTALLED_ROOT="\$part"
-                break
-            fi
-            umount /mnt/installed
+mkdir -p /mnt/installed
+
+# Try: LVM volumes, extended partitions (BCM uses p5), then standard partitions
+for part in \$(ls /dev/mapper/*-root /dev/mapper/*root 2>/dev/null) \
+            /dev/vda5 /dev/sda5 \
+            \$(lsblk -rno PATH,FSTYPE 2>/dev/null | awk '\$2 == "ext4" || \$2 == "xfs" {print \$1}') \
+            /dev/vda2 /dev/vda1 /dev/sda2 /dev/sda1; do
+    [ -b "\$part" ] || continue
+    if mount "\$part" /mnt/installed 2>/dev/null; then
+        if [ -f /mnt/installed/etc/default/grub ]; then
+            INSTALLED_ROOT="\$part"
+            echo "[OK] Found installed root at \$part"
+            break
         fi
+        umount /mnt/installed 2>/dev/null
     fi
 done
 
 if [ -n "\$INSTALLED_ROOT" ]; then
-    # Add net.ifnames=0 biosdevname=0 to GRUB_CMDLINE_LINUX
+    # Add net.ifnames=0 to GRUB_CMDLINE_LINUX (BCM already sets biosdevname=0)
     if ! grep -q "net.ifnames=0" /mnt/installed/etc/default/grub; then
-        sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 \1"/' \
+        sed -i 's/biosdevname=0/net.ifnames=0 biosdevname=0/' \
             /mnt/installed/etc/default/grub
+        echo "[OK] Patched /etc/default/grub"
     fi
-    # Update grub in chroot
-    mount --bind /dev /mnt/installed/dev
-    mount --bind /proc /mnt/installed/proc
-    mount --bind /sys /mnt/installed/sys
+    # Also patch grub.cfg directly (in case update-grub fails in chroot)
+    if [ -f /mnt/installed/boot/grub/grub.cfg ]; then
+        if ! grep -q "net.ifnames=0" /mnt/installed/boot/grub/grub.cfg; then
+            sed -i 's/biosdevname=0/net.ifnames=0 biosdevname=0/g' \
+                /mnt/installed/boot/grub/grub.cfg
+        fi
+        echo "[OK] Patched /boot/grub/grub.cfg"
+    fi
+    # Try update-grub in chroot
+    mount --bind /dev /mnt/installed/dev 2>/dev/null
+    mount --bind /proc /mnt/installed/proc 2>/dev/null
+    mount --bind /sys /mnt/installed/sys 2>/dev/null
     chroot /mnt/installed update-grub 2>/dev/null || \
         chroot /mnt/installed grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
-    umount /mnt/installed/sys /mnt/installed/proc /mnt/installed/dev
-    umount /mnt/installed
+    umount /mnt/installed/sys /mnt/installed/proc /mnt/installed/dev 2>/dev/null
+    umount /mnt/installed 2>/dev/null
     echo "[OK] GRUB updated: net.ifnames=0 biosdevname=0"
 else
     echo "[WARN] Could not find installed root partition to patch GRUB"
+    echo "[WARN] Listing all block devices for debugging:"
+    ls -la /dev/mapper/ 2>/dev/null || true
+    blkid 2>/dev/null || true
 fi
 
 echo "=========================================="
