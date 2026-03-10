@@ -212,15 +212,15 @@ validate: kairos-validate ## Run validation checks on Kairos node
 
 .PHONY: clean
 clean: ## Remove build/ artifacts (Kairos ISO + PXE)
-	rm -rf build/
+	sudo rm -rf build/
 
 .PHONY: clean-bcm
 clean-bcm: ## Remove BCM auto-install artifacts (build/.bcm-*)
-	rm -f build/.bcm-kernel build/.bcm-rootfs-auto.cgz build/.bcm-init.img
+	sudo rm -f build/.bcm-kernel build/.bcm-rootfs-auto.cgz build/.bcm-init.img
 
 .PHONY: clean-kairos
 clean-kairos: ## Remove PXE artifacts only (build/pxe/)
-	rm -rf build/pxe/
+	sudo rm -rf build/pxe/ build/palette-edge-installer.iso build/palette-edge-installer.iso.sha256
 
 .PHONY: clean-disks
 clean-disks: ## Remove all QEMU disk images
