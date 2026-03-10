@@ -1,0 +1,3 @@
+[submodule "CanvOS"]
+	path = CanvOS
+	url = https://github.com/spectrocloud/CanvOS

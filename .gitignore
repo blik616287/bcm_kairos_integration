@@ -1,0 +1,13 @@
+# BCM ISO (large binary)
+*.iso
+
+# QEMU disk images
+*.qcow2
+*.img
+
+# Auto-install build artifacts
+.bcm-kernel
+.bcm-rootfs-auto.cgz
+.bcm-init.img
+.bcm-work.*
+.bcm-prep.*

@@ -1,0 +1,311 @@
+#!/bin/bash
+# prepare-bcm-autoinstall.sh
+#
+# Takes a stock BCM ISO and produces modified artifacts for fully
+# hands-free automated KVM installation. Run this once after downloading
+# the ISO; then use launch-bcm-kvm.sh to boot it.
+#
+# What it does:
+#   1. Extracts rootfs.cgz and kernel from the ISO
+#   2. Patches build-config.xml (hostname, timezone)
+#   3. Injects bcm-autoinstall.service into rootfs (systemd)
+#      - Mounts ISO at /mnt/cdrom, passes --mountpath to installer
+#      - Pipes `yes` to stdin to handle any unexpected prompts
+#      - Uses --password and --autoreboot for non-interactive install
+#   4. Masks getty/login prompts, disables interactive installers
+#   5. Repacks rootfs.cgz
+#   6. Creates a FAT config drive image with the password
+#   7. Outputs: .bcm-kernel, .bcm-rootfs-auto.cgz, .bcm-init.img
+#
+# Usage:
+#   ./prepare-bcm-autoinstall.sh [OPTIONS]
+#
+# After running, launch with:
+#   ./launch-bcm-kvm.sh --auto
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ISO="${SCRIPT_DIR}/bcm-11.0-ubuntu2404.iso"
+
+# Output artifacts
+OUT_KERNEL="${SCRIPT_DIR}/.bcm-kernel"
+OUT_ROOTFS="${SCRIPT_DIR}/.bcm-rootfs-auto.cgz"
+OUT_INITIMG="${SCRIPT_DIR}/.bcm-init.img"
+
+# Defaults (override via flags or env)
+BCM_PASSWORD="${BCM_PASSWORD:-Br1ghtClust3r}"
+BCM_HOSTNAME="${BCM_HOSTNAME:-bcm11-headnode}"
+BCM_TIMEZONE="${BCM_TIMEZONE:-America/Los_Angeles}"
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Prepares a stock BCM ISO for fully automated KVM installation.
+
+Options:
+  --iso PATH          Path to BCM ISO (default: ./bcm-11.0-ubuntu2404.iso)
+  --password PASS     BCM admin/root password (default: Br1ghtClust3r)
+  --hostname NAME     Head node hostname (default: bcm11-headnode)
+  --timezone TZ       Timezone (default: America/Los_Angeles)
+  --clean             Remove existing artifacts before building
+  -h, --help          Show this help
+
+Environment variables (overridden by flags):
+  BCM_PASSWORD, BCM_HOSTNAME, BCM_TIMEZONE
+
+Outputs:
+  .bcm-kernel            Extracted kernel for direct QEMU boot
+  .bcm-rootfs-auto.cgz   Modified rootfs with auto-install injected
+  .bcm-init.img          FAT config drive with password
+
+After running, launch with:
+  ./launch-bcm-kvm.sh --auto
+EOF
+    exit 0
+}
+
+CLEAN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --iso)        ISO="$2"; shift 2 ;;
+        --password)   BCM_PASSWORD="$2"; shift 2 ;;
+        --hostname)   BCM_HOSTNAME="$2"; shift 2 ;;
+        --timezone)   BCM_TIMEZONE="$2"; shift 2 ;;
+        --clean)      CLEAN=true; shift ;;
+        -h|--help)    usage ;;
+        *)            echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+# ---- Preflight ----
+if [[ ! -f "$ISO" ]]; then
+    echo "ERROR: ISO not found at $ISO"
+    exit 1
+fi
+
+for cmd in cpio gzip mcopy mkfs.vfat; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: $cmd not found. Install with: sudo apt install cpio gzip mtools"
+        exit 1
+    fi
+done
+
+if [[ "$CLEAN" == "true" ]]; then
+    echo "Cleaning old artifacts..."
+    rm -f "$OUT_KERNEL" "$OUT_ROOTFS" "$OUT_INITIMG"
+fi
+
+if [[ -f "$OUT_KERNEL" ]] && [[ -f "$OUT_ROOTFS" ]] && [[ -f "$OUT_INITIMG" ]]; then
+    echo "Artifacts already exist. Use --clean to rebuild."
+    echo "  $OUT_KERNEL"
+    echo "  $OUT_ROOTFS"
+    echo "  $OUT_INITIMG"
+    exit 0
+fi
+
+# ---- Work dir with cleanup trap ----
+WORK_DIR=$(mktemp -d "${SCRIPT_DIR}/.bcm-prep.XXXXXX")
+cleanup() {
+    sudo umount "${WORK_DIR}/iso" 2>/dev/null || true
+    sudo rm -rf "${WORK_DIR}"
+}
+trap cleanup EXIT
+
+echo "============================================"
+echo " Preparing BCM Auto-Install Artifacts"
+echo "============================================"
+echo " ISO:       $ISO"
+echo " Password:  $(echo "$BCM_PASSWORD" | sed 's/./*/g')"
+echo " Hostname:  $BCM_HOSTNAME"
+echo " Timezone:  $BCM_TIMEZONE"
+echo "============================================"
+echo ""
+
+# ---- 1. Mount ISO ----
+mkdir -p "${WORK_DIR}/iso"
+sudo mount -o loop "$ISO" "${WORK_DIR}/iso"
+
+# ---- 2. Extract kernel ----
+echo "[1/6] Extracting kernel..."
+sudo cp "${WORK_DIR}/iso/boot/kernel" "$OUT_KERNEL"
+sudo chmod 644 "$OUT_KERNEL"
+
+# ---- 3. Extract rootfs ----
+echo "[2/6] Extracting rootfs.cgz (takes a moment)..."
+mkdir -p "${WORK_DIR}/rootfs"
+cd "${WORK_DIR}/rootfs"
+gunzip -dc "${WORK_DIR}/iso/boot/rootfs.cgz" | sudo cpio -iumd 2>/dev/null
+
+# Done with the ISO
+sudo umount "${WORK_DIR}/iso"
+
+# ---- 4. Patch build-config.xml ----
+echo "[3/6] Patching build-config.xml..."
+sudo sed -i "s|<hostname>bcm11-headnode</hostname>|<hostname>${BCM_HOSTNAME}</hostname>|g" \
+    "${WORK_DIR}/rootfs/cm/build-config.xml"
+sudo sed -i "s|<timezone>America/Los_Angeles</timezone>|<timezone>${BCM_TIMEZONE}</timezone>|g" \
+    "${WORK_DIR}/rootfs/cm/build-config.xml"
+
+# ---- 5. Inject auto-install script ----
+echo "[4/6] Injecting auto-install service..."
+sudo tee "${WORK_DIR}/rootfs/usr/local/bin/bcm-autoinstall.sh" > /dev/null <<AUTOSCRIPT
+#!/bin/bash
+# BCM Fully Automated Head Node Install
+# Generated by prepare-bcm-autoinstall.sh
+
+export DEBIAN_FRONTEND=noninteractive
+LOG="/var/log/bcm-auto-install.log"
+
+# Take over console, no stdin
+exec </dev/null >>/dev/console 2>&1
+exec > >(tee -a "\$LOG" >/dev/console) 2>&1
+
+# Kill getty so login prompts don't cover output
+systemctl stop serial-getty@ttyS0.service 2>/dev/null || true
+systemctl stop getty@tty1.service 2>/dev/null || true
+clear >/dev/console 2>/dev/null || true
+
+echo ""
+echo "=========================================="
+echo " BCM Automated Installation"
+echo " \$(date)"
+echo "=========================================="
+echo ""
+
+# Get password from config drive or use baked-in default
+PASS="${BCM_PASSWORD}"
+mkdir -p /mnt/config
+for dev in /dev/vdb /dev/sdb /dev/vdb1 /dev/sdb1; do
+    if [ -b "\$dev" ]; then
+        if mount "\$dev" /mnt/config 2>/dev/null; then
+            [ -f /mnt/config/password.txt ] && PASS=\$(cat /mnt/config/password.txt)
+            echo "[OK] Config drive mounted from \$dev"
+            break
+        fi
+    fi
+done
+
+# Wait for bright-installer-configure.service
+echo "[..] Waiting for installer environment..."
+TRIES=0
+while [ ! -f /var/www/htdocs/content/masterdisklayouts/master-one-big-partition.xml ] && [ "\$TRIES" -lt 60 ]; do
+    sleep 2
+    (( TRIES++ ))
+done
+
+if [ ! -f /var/www/htdocs/content/masterdisklayouts/master-one-big-partition.xml ]; then
+    echo "[FAIL] Installer environment did not become ready"
+    exit 1
+fi
+echo "[OK] Installer environment ready"
+
+# Mount ISO at /mnt/cdrom
+echo "[..] Mounting installation media..."
+mkdir -p /mnt/cdrom
+ISODEVICE=""
+for dev in /dev/sr0 /dev/sr1 /dev/cdrom /dev/dvd; do
+    if [ -b "\$dev" ]; then
+        if mount -o ro "\$dev" /mnt/cdrom 2>/dev/null; then
+            ISODEVICE="\$dev"
+            echo "[OK] ISO mounted from \$dev"
+            break
+        fi
+    fi
+done
+if [ -z "\$ISODEVICE" ]; then
+    LABEL_DEV=\$(findfs LABEL=BCMINSTALLERHEAD 2>/dev/null || true)
+    if [ -n "\$LABEL_DEV" ] && [ -b "\$LABEL_DEV" ]; then
+        mount -o ro "\$LABEL_DEV" /mnt/cdrom 2>/dev/null
+        echo "[OK] ISO mounted from \$LABEL_DEV (by label)"
+    fi
+fi
+if ! mountpoint -q /mnt/cdrom || [ ! -d /mnt/cdrom/data ]; then
+    echo "[FAIL] Could not mount installation media"
+    lsblk
+    exit 1
+fi
+
+echo ""
+echo "=========================================="
+echo " Running cm-master-install (14 steps)"
+echo "=========================================="
+echo ""
+
+cd /cm
+yes | perl ./cm-master-install \\
+    --config /cm/build-config.xml \\
+    --mountpath /mnt/cdrom \\
+    --password "\$PASS" \\
+    --autoreboot 2>&1 | tee -a "\$LOG"
+
+RETVAL=\${PIPESTATUS[1]}
+echo ""
+if [ \$RETVAL -ne 0 ]; then
+    echo "=========================================="
+    echo " INSTALLATION FAILED (exit code: \$RETVAL)"
+    echo " Log: /var/log/install-log"
+    echo "=========================================="
+    exit \$RETVAL
+else
+    echo "=========================================="
+    echo " INSTALLATION COMPLETE - rebooting..."
+    echo "=========================================="
+fi
+AUTOSCRIPT
+sudo chmod +x "${WORK_DIR}/rootfs/usr/local/bin/bcm-autoinstall.sh"
+
+# ---- Systemd unit ----
+sudo tee "${WORK_DIR}/rootfs/usr/lib/systemd/system/bcm-autoinstall.service" > /dev/null <<'UNIT'
+[Unit]
+Description=BCM Automated Head Node Installation
+Requires=bright-installer-configure.service
+After=bright-installer-configure.service network-online.target
+Conflicts=bright-installer-text.service bright-installer-graphical.service bright-installer-graphical-lowgfx.service bright-installer-backend.service bright-installer-remote.service getty@tty1.service serial-getty@ttyS0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bcm-autoinstall.sh
+StandardInput=null
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Enable auto-install, disable interactive installers and getty
+sudo mkdir -p "${WORK_DIR}/rootfs/etc/systemd/system/multi-user.target.wants"
+sudo ln -sf /usr/lib/systemd/system/bcm-autoinstall.service \
+    "${WORK_DIR}/rootfs/etc/systemd/system/multi-user.target.wants/bcm-autoinstall.service"
+sudo rm -f "${WORK_DIR}/rootfs/etc/systemd/system/multi-user.target.wants/bright-installer-text.service" 2>/dev/null
+sudo rm -f "${WORK_DIR}/rootfs/etc/systemd/system/graphical.target.wants/bright-installer-graphical.service" 2>/dev/null
+sudo ln -sf /dev/null "${WORK_DIR}/rootfs/etc/systemd/system/getty@tty1.service"
+sudo ln -sf /dev/null "${WORK_DIR}/rootfs/etc/systemd/system/serial-getty@ttyS0.service"
+
+# ---- 6. Repack rootfs ----
+echo "[5/6] Repacking rootfs.cgz (takes a moment)..."
+cd "${WORK_DIR}/rootfs"
+sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip --fast > "$OUT_ROOTFS"
+
+# ---- 7. Create config drive ----
+echo "[6/6] Creating config drive..."
+dd if=/dev/zero of="$OUT_INITIMG" bs=1M count=4 2>/dev/null
+mkfs.vfat -n BCMCONFIG "$OUT_INITIMG" >/dev/null 2>&1
+echo -n "$BCM_PASSWORD" > "${WORK_DIR}/password.txt"
+mcopy -i "$OUT_INITIMG" "${WORK_DIR}/password.txt" ::password.txt
+
+echo ""
+echo "============================================"
+echo " Build complete!"
+echo "============================================"
+echo " Artifacts:"
+echo "   $OUT_KERNEL"
+echo "   $OUT_ROOTFS"
+echo "   $OUT_INITIMG"
+echo ""
+echo " Next: ./launch-bcm-kvm.sh --auto"
+echo "============================================"
