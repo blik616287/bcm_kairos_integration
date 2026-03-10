@@ -3,10 +3,12 @@
 #
 # Launches BCM 11.0 in a KVM virtual machine.
 #
-# Two modes:
+# Three modes:
 #   Interactive:  ./launch-bcm-kvm.sh
 #   Auto-install: ./launch-bcm-kvm.sh --auto
 #                 (requires running prepare-bcm-autoinstall.sh first)
+#   Disk boot:    ./launch-bcm-kvm.sh --disk
+#                 (boot from installed disk, no ISO/ramdisk)
 #
 # Two NICs are configured:
 #   eth0 - Internal cluster network (isolated)
@@ -33,6 +35,7 @@ AUTO_INITIMG="${BCM_DIR}/.bcm-init.img"
 
 AUTO_INSTALL=false
 TEXT_MODE=false
+DISK_BOOT=false
 RESET=false
 
 usage() {
@@ -41,6 +44,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --auto              Fully automated install (run prepare-bcm-autoinstall.sh first)
+  --disk              Boot from installed disk (post-install)
   --text              Use text installer in interactive mode
   --ram MB            RAM in MB (default: 8192)
   --cpus N            Number of CPUs (default: 4)
@@ -55,6 +59,7 @@ Examples:
   $0 --auto             # Fully automated (hands-free) install
   $0 --auto --reset     # Fresh automated install
   $0 --text             # Interactive text install
+  $0 --disk             # Boot installed system from disk
 EOF
     exit 0
 }
@@ -62,6 +67,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --auto)        AUTO_INSTALL=true; shift ;;
+        --disk)        DISK_BOOT=true; shift ;;
         --text)        TEXT_MODE=true; shift ;;
         --ram)         RAM="$2"; shift 2 ;;
         --cpus)        CPUS="$2"; shift 2 ;;
@@ -75,7 +81,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- Preflight ----
-if [[ ! -f "$ISO" ]]; then
+if [[ "$DISK_BOOT" != "true" ]] && [[ ! -f "$ISO" ]]; then
     echo "ERROR: ISO not found at $ISO"
     exit 1
 fi
@@ -116,10 +122,25 @@ fi
 # ---- Build QEMU command ----
 EXTRA_ARGS=""
 INIT_DISK=""
+CDROM_ARG="-cdrom ${ISO}"
+BOOT_ARG="-boot d"
 
-if [[ "$AUTO_INSTALL" == "true" ]]; then
+if [[ "$DISK_BOOT" == "true" ]]; then
+    # Post-install: boot from disk, no ISO needed
+    CDROM_ARG=""
+    BOOT_ARG="-boot c"
+elif [[ "$AUTO_INSTALL" == "true" ]]; then
     INIT_DISK="-drive file=${AUTO_INITIMG},format=raw,if=virtio"
     EXTRA_ARGS="-kernel ${AUTO_KERNEL} -initrd ${AUTO_ROOTFS} -append \"dvdinstall nokeymap root=/dev/ram0 rw vga=normal bcmblacklist=nouveau systemd.unit=multi-user.target console=tty0 console=ttyS0,115200 net.ifnames=0 biosdevname=0\""
+fi
+
+# Determine mode label
+if [[ "$DISK_BOOT" == "true" ]]; then
+    MODE_LABEL="Disk boot (post-install)"
+elif [[ "$AUTO_INSTALL" == "true" ]]; then
+    MODE_LABEL="Automated (hands-free)"
+else
+    MODE_LABEL="$([ "$TEXT_MODE" == "true" ] && echo "Text" || echo "Graphical")"
 fi
 
 echo ""
@@ -129,15 +150,17 @@ echo "========================================"
 echo " RAM:       ${RAM} MB"
 echo " CPUs:      ${CPUS}"
 echo " Disk:      ${DISK}"
-if [[ "$AUTO_INSTALL" == "true" ]]; then
-echo " Mode:      Automated (hands-free)"
-else
-echo " Mode:      $([ "$TEXT_MODE" == "true" ] && echo "Text" || echo "Graphical")"
-fi
+echo " Mode:      ${MODE_LABEL}"
 echo " SSH:       localhost:${SSH_PORT} -> vm:22"
 echo " HTTPS:     localhost:${HTTPS_PORT} -> vm:443"
 echo "========================================"
 echo ""
+
+if [[ "$DISK_BOOT" == "true" ]] && [[ ! -f "$DISK" ]]; then
+    echo "ERROR: Disk image not found at $DISK"
+    echo "Run an install first (--auto or interactive)."
+    exit 1
+fi
 
 # NIC order matters: first = eth0 (internal), second = eth1 (external)
 eval exec qemu-system-x86_64 \
@@ -146,8 +169,8 @@ eval exec qemu-system-x86_64 \
     -smp "${CPUS}" \
     -cpu host \
     -name "${VM_NAME}" \
-    -cdrom "${ISO}" \
-    -boot d \
+    ${CDROM_ARG} \
+    ${BOOT_ARG} \
     -drive file="${DISK}",format=qcow2,if=virtio \
     ${INIT_DISK} \
     -netdev socket,id=intnet,listen=:31337 \

@@ -250,6 +250,28 @@ if [ \$RETVAL -ne 0 ]; then
     echo "=========================================="
     exit \$RETVAL
 else
+    # Fix NIC naming: ensure net.ifnames=0 is in GRUB config on installed disk
+    # The installer sets biosdevname=0 but misses net.ifnames=0, causing
+    # predictable NIC names (enp1s0) instead of classic eth0/eth1
+    echo ""
+    echo "[..] Patching GRUB for classic NIC naming (net.ifnames=0)..."
+    if [ -f /mnt/hd/etc/default/grub ]; then
+        if ! grep -q 'net.ifnames=0' /mnt/hd/etc/default/grub; then
+            sed -i 's/GRUB_CMDLINE_LINUX="biosdevname=0/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0/' /mnt/hd/etc/default/grub
+            # Regenerate grub.cfg in the installed system
+            chroot /mnt/hd update-grub 2>&1 || true
+            echo "[OK] GRUB patched with net.ifnames=0"
+        else
+            echo "[OK] net.ifnames=0 already present in GRUB config"
+        fi
+    else
+        echo "[WARN] /mnt/hd/etc/default/grub not found, patching grub.cfg directly"
+        if [ -f /mnt/hd/boot/grub/grub.cfg ]; then
+            sed -i 's/biosdevname=0/net.ifnames=0 biosdevname=0/g' /mnt/hd/boot/grub/grub.cfg
+        fi
+    fi
+
+    echo ""
     echo "=========================================="
     echo " INSTALLATION COMPLETE - rebooting..."
     echo "=========================================="
