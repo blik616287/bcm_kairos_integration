@@ -1,0 +1,333 @@
+#!/bin/bash
+# validate-kairos.sh
+#
+# Validates that a Kairos compute node booted correctly via BCM PXE.
+# Connects through the BCM head node and runs a series of checks.
+#
+# Usage:
+#   ./validate-kairos.sh [OPTIONS]
+#
+# Prerequisites:
+#   1. BCM head node running (SSH at localhost:10022)
+#   2. Kairos compute node booted (via test-kairos-pxe.sh)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# BCM head node
+SSH_PORT=10022
+BCM_PASSWORD="${BCM_PASSWORD:?ERROR: BCM_PASSWORD not set. Set in env.json or export BCM_PASSWORD}"
+
+# Kairos node
+KAIROS_USER="kairos"
+KAIROS_PASSWORD="kairos"
+KAIROS_IP=""
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Validates a Kairos compute node booted via BCM PXE.
+
+Options:
+  --ssh-port PORT      BCM head node SSH port (default: 10022)
+  --password PASS      BCM root password (default: Br1ghtClust3r)
+  --kairos-ip IP       Kairos node IP (default: auto-detect from DHCP leases)
+  --kairos-user USER   Kairos SSH user (default: kairos)
+  --kairos-pass PASS   Kairos SSH password (default: kairos)
+  -h, --help           Show this help
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ssh-port)     SSH_PORT="$2"; shift 2 ;;
+        --password)     BCM_PASSWORD="$2"; shift 2 ;;
+        --kairos-ip)    KAIROS_IP="$2"; shift 2 ;;
+        --kairos-user)  KAIROS_USER="$2"; shift 2 ;;
+        --kairos-pass)  KAIROS_PASSWORD="$2"; shift 2 ;;
+        -h|--help)      usage ;;
+        *)              echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+BCM_SSH="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${SSH_PORT} root@localhost"
+
+PASS=0
+FAIL=0
+WARN=0
+
+check() {
+    local name="$1"
+    local result="$2"
+    local detail="$3"
+
+    if [[ "$result" == "PASS" ]]; then
+        echo "  [PASS] ${name}"
+        [[ -n "$detail" ]] && echo "         ${detail}"
+        PASS=$((PASS + 1))
+    elif [[ "$result" == "WARN" ]]; then
+        echo "  [WARN] ${name}"
+        [[ -n "$detail" ]] && echo "         ${detail}"
+        WARN=$((WARN + 1))
+    else
+        echo "  [FAIL] ${name}"
+        [[ -n "$detail" ]] && echo "         ${detail}"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# ---- Preflight ----
+if ! command -v sshpass &>/dev/null; then
+    echo "ERROR: sshpass not found. Install with: sudo apt install sshpass"
+    exit 1
+fi
+
+echo "============================================"
+echo " Kairos Node Validation"
+echo "============================================"
+echo ""
+
+# ---- Connect to head node ----
+echo "[..] Connecting to BCM head node..."
+if ! ${BCM_SSH} "echo ok" &>/dev/null; then
+    echo "ERROR: Cannot SSH to BCM head node at localhost:${SSH_PORT}"
+    exit 1
+fi
+echo "[OK] BCM head node reachable"
+echo ""
+
+# ---- Find Kairos node IP ----
+if [[ -z "$KAIROS_IP" ]]; then
+    echo "[..] Auto-detecting Kairos node IP from DHCP leases..."
+    KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep '52:54:00:00:02:01' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null)
+    if [[ -z "$KAIROS_IP" ]]; then
+        echo "ERROR: Could not find Kairos node in DHCP leases."
+        echo "Is the compute node running? (./test-kairos-pxe.sh --direct)"
+        exit 1
+    fi
+fi
+echo "[OK] Kairos node IP: ${KAIROS_IP}"
+echo ""
+
+# ---- SSH to Kairos node through head node ----
+echo "[..] Testing SSH to Kairos node (${KAIROS_USER}@${KAIROS_IP})..."
+KAIROS_SSH="${BCM_SSH} \"sshpass -p '${KAIROS_PASSWORD}' ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP}\""
+
+# Test SSH connectivity
+SSH_TEST=$(${BCM_SSH} "sshpass -p '${KAIROS_PASSWORD}' ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null || true)
+if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
+    echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
+    echo "SSH output: ${SSH_TEST}"
+    echo ""
+    echo "The node may still be booting, or user-data was not applied."
+    echo "Try again in a minute, or check the console."
+    exit 1
+fi
+echo "[OK] SSH connected"
+echo ""
+
+# ---- Run validation checks ----
+echo "============================================"
+echo " Running Checks"
+echo "============================================"
+echo ""
+
+# Collect all info in one SSH session to minimize round-trips
+VALIDATION=$(${BCM_SSH} "sshpass -p '${KAIROS_PASSWORD}' ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} '
+echo \"===OS_RELEASE===\"
+cat /etc/os-release 2>/dev/null
+echo \"===KAIROS_RELEASE===\"
+cat /etc/kairos-release 2>/dev/null || echo MISSING
+echo \"===KAIROS_VERSION===\"
+kairos-agent version 2>/dev/null || echo MISSING
+echo \"===HOSTNAME===\"
+hostname 2>/dev/null
+echo \"===KERNEL===\"
+uname -r 2>/dev/null
+echo \"===CMDLINE===\"
+cat /proc/cmdline 2>/dev/null
+echo \"===K3S_BIN===\"
+ls -la /usr/local/bin/k3s 2>/dev/null || which k3s 2>/dev/null || echo MISSING
+echo \"===K3S_VERSION===\"
+k3s --version 2>/dev/null || echo MISSING
+echo \"===KUBECTL===\"
+which kubectl 2>/dev/null || echo MISSING
+echo \"===SYSTEMD_KAIROS===\"
+systemctl list-units --all --no-pager 2>/dev/null | grep -iE \"kairos|k3s|stylus\" || echo NONE
+echo \"===SERVICES===\"
+systemctl is-active kairos-agent 2>/dev/null || echo inactive
+echo \"---\"
+systemctl is-active stylus 2>/dev/null || echo inactive
+echo \"===NETWORK===\"
+ip -4 addr show 2>/dev/null | grep inet
+echo \"===IMMUCORE===\"
+journalctl -u immucore 2>/dev/null | grep -i \"version\" | head -1 || echo MISSING
+echo \"===SQUASHFS===\"
+mount 2>/dev/null | grep squashfs || echo NOT_MOUNTED
+echo \"===LIVE_BOOT===\"
+cat /run/cos/cos-layout.env 2>/dev/null || echo MISSING
+echo \"===USERS===\"
+grep kairos /etc/passwd 2>/dev/null || echo MISSING
+echo \"===ISSUE===\"
+cat /etc/issue 2>/dev/null || echo MISSING
+echo \"===END===\"
+'" 2>/dev/null)
+
+# Parse results
+get_section() {
+    echo "$VALIDATION" | sed -n "/===${1}===/,/===.*===/p" | grep -v "^===" | head -20 || true
+}
+
+# 1. OS Release
+echo "-- Operating System --"
+OS_NAME=$(get_section "OS_RELEASE" | grep "^PRETTY_NAME=" | cut -d'"' -f2)
+if [[ -n "$OS_NAME" ]]; then check "OS identified" "PASS" "$OS_NAME"; else check "OS identified" "FAIL" ""; fi
+
+# 2. Kairos Release
+KAIROS_REL=$(get_section "KAIROS_RELEASE")
+if [[ "$KAIROS_REL" != "MISSING" ]] && [[ -n "$KAIROS_REL" ]]; then
+    KAIROS_VER_STR=$(echo "$KAIROS_REL" | grep "KAIROS_VERSION" | head -1 | cut -d'=' -f2)
+    check "Kairos release file" "PASS" "${KAIROS_VER_STR:-present}"
+else
+    check "Kairos release file" "FAIL" "/etc/kairos-release not found"
+fi
+
+# 3. Kairos Agent
+KAIROS_AGENT=$(get_section "KAIROS_VERSION")
+if [[ "$KAIROS_AGENT" != "MISSING" ]] && [[ -n "$KAIROS_AGENT" ]]; then
+    check "kairos-agent binary" "PASS" "$KAIROS_AGENT"
+else
+    check "kairos-agent binary" "FAIL" "not found in PATH"
+fi
+
+# 4. Immucore
+IMMUCORE=$(get_section "IMMUCORE")
+if [[ "$IMMUCORE" != "MISSING" ]] && [[ -n "$IMMUCORE" ]]; then
+    check "Immucore (init)" "PASS" "$(echo "$IMMUCORE" | grep -oP 'version=\S+' || echo 'present')"
+else
+    check "Immucore (init)" "WARN" "could not read journal"
+fi
+
+# 5. Kernel
+echo ""
+echo "-- Kernel & Boot --"
+KERNEL=$(get_section "KERNEL")
+if [[ -n "$KERNEL" ]]; then check "Kernel" "PASS" "$KERNEL"; else check "Kernel" "FAIL" ""; fi
+
+CMDLINE=$(get_section "CMDLINE")
+if echo "$CMDLINE" | grep -q "rd.cos.disable"; then
+    check "Kairos boot params" "PASS" "rd.cos.disable present"
+else
+    check "Kairos boot params" "FAIL" "missing expected boot params"
+fi
+
+if echo "$CMDLINE" | grep -q "config_url"; then
+    check "config_url param" "PASS" "user-data URL in cmdline"
+else
+    check "config_url param" "WARN" "not in cmdline (user-data may not be applied)"
+fi
+
+# 6. Squashfs mount
+SQFS=$(get_section "SQUASHFS")
+if [[ "$SQFS" != "NOT_MOUNTED" ]] && [[ -n "$SQFS" ]]; then
+    check "Squashfs rootfs" "PASS" "mounted"
+else
+    check "Squashfs rootfs" "WARN" "not detected (may use different mount)"
+fi
+
+# 7. Network
+echo ""
+echo "-- Networking --"
+NETWORK=$(get_section "NETWORK")
+if [[ -n "$NETWORK" ]]; then
+    KAIROS_NET_IP=$(echo "$NETWORK" | grep -v "127.0.0" | head -1 | awk '{print $2}')
+    check "Network interface" "PASS" "$KAIROS_NET_IP"
+else
+    check "Network interface" "FAIL" "no IPv4 address"
+fi
+
+# 8. Kubernetes
+echo ""
+echo "-- Kubernetes --"
+K3S_BIN=$(get_section "K3S_BIN")
+if [[ "$K3S_BIN" != "MISSING" ]] && [[ -n "$K3S_BIN" ]]; then
+    check "k3s binary" "PASS" "$(echo "$K3S_BIN" | head -1)"
+else
+    check "k3s binary" "FAIL" "not found"
+fi
+
+K3S_VER=$(get_section "K3S_VERSION")
+if [[ "$K3S_VER" != "MISSING" ]] && [[ -n "$K3S_VER" ]]; then
+    check "k3s version" "PASS" "$K3S_VER"
+else
+    check "k3s version" "WARN" "k3s not running (expected without Palette registration)"
+fi
+
+KUBECTL=$(get_section "KUBECTL")
+if [[ "$KUBECTL" != "MISSING" ]] && [[ -n "$KUBECTL" ]]; then
+    check "kubectl" "PASS" "$KUBECTL"
+else
+    check "kubectl" "WARN" "not in PATH"
+fi
+
+# 9. Services
+echo ""
+echo "-- Services --"
+SERVICES=$(get_section "SYSTEMD_KAIROS")
+if [[ "$SERVICES" != "NONE" ]] && [[ -n "$SERVICES" ]]; then
+    SVC_COUNT=$(echo "$SERVICES" | wc -l)
+    check "Kairos/Stylus services" "PASS" "${SVC_COUNT} service(s) found"
+    echo "$SERVICES" | while read -r line; do
+        echo "         $line"
+    done
+else
+    check "Kairos/Stylus services" "FAIL" "no kairos/stylus services"
+fi
+
+SVC_STATUS=$(get_section "SERVICES")
+KAIROS_ACTIVE=$(echo "$SVC_STATUS" | head -1)
+STYLUS_ACTIVE=$(echo "$SVC_STATUS" | tail -1)
+if [[ "$KAIROS_ACTIVE" == "active" ]]; then check "kairos-agent service" "PASS" "active"; else check "kairos-agent service" "WARN" "$KAIROS_ACTIVE"; fi
+if [[ "$STYLUS_ACTIVE" == "active" ]]; then check "stylus service" "PASS" "active"; else check "stylus service" "WARN" "$STYLUS_ACTIVE"; fi
+
+# 10. User
+echo ""
+echo "-- User Config --"
+USERS=$(get_section "USERS")
+if [[ "$USERS" != "MISSING" ]] && [[ -n "$USERS" ]]; then
+    check "kairos user" "PASS" "exists"
+else
+    check "kairos user" "FAIL" "not found in /etc/passwd"
+fi
+check "SSH login" "PASS" "${KAIROS_USER}@${KAIROS_IP} (password auth)"
+
+# 11. Console banner
+ISSUE=$(get_section "ISSUE")
+if echo "$ISSUE" | grep -qi "kairos"; then
+    check "Kairos banner" "PASS" "present in /etc/issue"
+else
+    check "Kairos banner" "WARN" "no Kairos branding in /etc/issue (cosmetic)"
+fi
+
+# ---- Summary ----
+TOTAL=$((PASS + FAIL + WARN))
+echo ""
+echo "============================================"
+echo " Validation Summary"
+echo "============================================"
+echo " PASS: ${PASS}/${TOTAL}"
+echo " WARN: ${WARN}/${TOTAL}"
+echo " FAIL: ${FAIL}/${TOTAL}"
+echo "============================================"
+
+if [[ $FAIL -gt 0 ]]; then
+    echo " Result: SOME CHECKS FAILED"
+    exit 1
+else
+    echo " Result: ALL CHECKS PASSED"
+    exit 0
+fi

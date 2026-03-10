@@ -1,13 +1,24 @@
-# BCM ISO (large binary)
+# Large binaries (any directory)
 *.iso
-
-# QEMU disk images
 *.qcow2
 *.img
 
-# Auto-install build artifacts
-.bcm-kernel
-.bcm-rootfs-auto.cgz
-.bcm-init.img
+# Temp work directories
 .bcm-work.*
 .bcm-prep.*
+
+# Build output
+build/
+
+# Serial console logs
+logs/
+
+# Downloaded ISOs
+dist/
+
+# Environment config (contains secrets)
+env.json
+
+# Claude Code
+.claude/
+CLAUDE.md
