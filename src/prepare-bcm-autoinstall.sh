@@ -26,15 +26,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ISO="${SCRIPT_DIR}/bcm-11.0-ubuntu2404.iso"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ISO="${ISO_PATH:-${PROJECT_DIR}/dist/bcm-11.0-ubuntu2404.iso}"
 
 # Output artifacts
-OUT_KERNEL="${SCRIPT_DIR}/.bcm-kernel"
-OUT_ROOTFS="${SCRIPT_DIR}/.bcm-rootfs-auto.cgz"
-OUT_INITIMG="${SCRIPT_DIR}/.bcm-init.img"
+BUILD_DIR="${PROJECT_DIR}/build"
+OUT_KERNEL="${BUILD_DIR}/.bcm-kernel"
+OUT_ROOTFS="${BUILD_DIR}/.bcm-rootfs-auto.cgz"
+OUT_INITIMG="${BUILD_DIR}/.bcm-init.img"
 
 # Defaults (override via flags or env)
-BCM_PASSWORD="${BCM_PASSWORD:-Br1ghtClust3r}"
+BCM_PASSWORD="${BCM_PASSWORD:?ERROR: BCM_PASSWORD not set. Set in env.json or export BCM_PASSWORD}"
 BCM_HOSTNAME="${BCM_HOSTNAME:-bcm11-headnode}"
 BCM_TIMEZONE="${BCM_TIMEZONE:-America/Los_Angeles}"
 
@@ -107,7 +109,7 @@ if [[ -f "$OUT_KERNEL" ]] && [[ -f "$OUT_ROOTFS" ]] && [[ -f "$OUT_INITIMG" ]]; 
 fi
 
 # ---- Work dir with cleanup trap ----
-WORK_DIR=$(mktemp -d "${SCRIPT_DIR}/.bcm-prep.XXXXXX")
+WORK_DIR=$(mktemp -d "${PROJECT_DIR}/.bcm-prep.XXXXXX")
 cleanup() {
     sudo umount "${WORK_DIR}/iso" 2>/dev/null || true
     sudo rm -rf "${WORK_DIR}"
@@ -249,11 +251,46 @@ if [ \$RETVAL -ne 0 ]; then
     echo " Log: /var/log/install-log"
     echo "=========================================="
     exit \$RETVAL
-else
-    echo "=========================================="
-    echo " INSTALLATION COMPLETE - rebooting..."
-    echo "=========================================="
 fi
+
+# ---- Post-install: fix interface naming in GRUB ----
+echo "[..] Fixing network interface naming in GRUB..."
+INSTALLED_ROOT=""
+for part in /dev/vda2 /dev/vda1 /dev/sda2 /dev/sda1; do
+    if [ -b "\$part" ]; then
+        mkdir -p /mnt/installed
+        if mount "\$part" /mnt/installed 2>/dev/null; then
+            if [ -f /mnt/installed/etc/default/grub ]; then
+                INSTALLED_ROOT="\$part"
+                break
+            fi
+            umount /mnt/installed
+        fi
+    fi
+done
+
+if [ -n "\$INSTALLED_ROOT" ]; then
+    # Add net.ifnames=0 biosdevname=0 to GRUB_CMDLINE_LINUX
+    if ! grep -q "net.ifnames=0" /mnt/installed/etc/default/grub; then
+        sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 \1"/' \
+            /mnt/installed/etc/default/grub
+    fi
+    # Update grub in chroot
+    mount --bind /dev /mnt/installed/dev
+    mount --bind /proc /mnt/installed/proc
+    mount --bind /sys /mnt/installed/sys
+    chroot /mnt/installed update-grub 2>/dev/null || \
+        chroot /mnt/installed grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
+    umount /mnt/installed/sys /mnt/installed/proc /mnt/installed/dev
+    umount /mnt/installed
+    echo "[OK] GRUB updated: net.ifnames=0 biosdevname=0"
+else
+    echo "[WARN] Could not find installed root partition to patch GRUB"
+fi
+
+echo "=========================================="
+echo " INSTALLATION COMPLETE - rebooting..."
+echo "=========================================="
 AUTOSCRIPT
 sudo chmod +x "${WORK_DIR}/rootfs/usr/local/bin/bcm-autoinstall.sh"
 
