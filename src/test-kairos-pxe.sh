@@ -187,18 +187,21 @@ fi
 CM_CREATE
     fi
 
-    echo "[4/7] Placing user-data and stylus cloud-configs..."
+    echo "[4/7] Placing user-data..."
     ${SCP_CMD} "${PXE_DIR}/user-data.yaml" root@localhost:/cm/images/kairos-image/oem/99_userdata.yaml
-    # 80_stylus.yaml must exist in /oem/ or stylus-agent crashes on boot.
-    # In a normal Kairos install, boot stages copy it; BCM provisioning skips those stages.
-    ${SSH_CMD} << 'STYLUS_COPY'
-if [ ! -f /cm/images/kairos-image/oem/80_stylus.yaml ] && [ -f /cm/images/kairos-image/etc/kairos/80_stylus.yaml ]; then
-    cp /cm/images/kairos-image/etc/kairos/80_stylus.yaml /cm/images/kairos-image/oem/80_stylus.yaml
-    echo "[OK] Copied 80_stylus.yaml to /oem/"
+    # 80_stylus.yaml must NOT be in /oem/ during initial registration.
+    # With it present, stylus-agent takes the upgrade path instead of registration,
+    # which crashes on auth failure and poisons Palette rate limits.
+    # Without it, the agent enters registration mode and retries properly.
+    # After successful registration, stylus-agent creates its own config files.
+    ${SSH_CMD} << 'STYLUS_CHECK'
+if [ -f /cm/images/kairos-image/oem/80_stylus.yaml ]; then
+    rm -f /cm/images/kairos-image/oem/80_stylus.yaml
+    echo "[OK] Removed 80_stylus.yaml from /oem/ (prevents upgrade-path crash)"
 else
-    echo "[OK] 80_stylus.yaml already in /oem/"
+    echo "[OK] 80_stylus.yaml not in /oem/ (correct for registration)"
 fi
-STYLUS_COPY
+STYLUS_CHECK
 
     echo "[5/7] Configuring image for BCM provisioning..."
     ${SSH_CMD} << 'IMAGE_FIXES'

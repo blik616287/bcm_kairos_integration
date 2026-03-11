@@ -28,6 +28,14 @@ if ! grep -q "stylus.registration" /proc/cmdline 2>/dev/null; then
         echo "$(cat /proc/cmdline) stylus.registration" > /tmp/cmdline-registration
         mount --bind /tmp/cmdline-registration /proc/cmdline
         echo "bcm-sync: enabled registration mode (no auth token found)"
+
+        # 80_stylus.yaml in /oem/ triggers the upgrade path instead of registration,
+        # which crashes on auth failure and poisons Palette rate limits.
+        # Remove it so stylus-agent enters registration mode properly.
+        if [ -f /oem/80_stylus.yaml ]; then
+            rm -f /oem/80_stylus.yaml
+            echo "bcm-sync: removed /oem/80_stylus.yaml (prevents upgrade-path crash)"
+        fi
     fi
 fi
 
