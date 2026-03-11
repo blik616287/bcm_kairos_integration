@@ -7,9 +7,10 @@ Automated end-to-end pipeline for deploying a BCM 11.0 head node and Kairos edge
 ### 1. Setup
 
 ```bash
-cp env.json.example env.json     # Create config file
+git submodule update --init --recursive  # Initialize submodules (CanvOS, etc.)
+cp env.json.example env.json             # Create config file
 # Edit env.json — fill in bcm_password, palette_token, palette_project_uid, jfrog_token
-make setup                       # Verify all prerequisites are installed
+make setup                               # Verify all prerequisites are installed
 ```
 
 ### 2. Download BCM ISO
