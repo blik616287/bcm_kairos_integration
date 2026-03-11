@@ -1,25 +1,23 @@
 #!/bin/bash
 # test-kairos-pxe.sh
 #
-# Deploys Kairos as a BCM software image and launches a compute node VM
-# that gets provisioned by BCM's native PXE boot chain.
+# End-to-end: deploys Kairos as a BCM software image and boots a compute node.
 #
-# How it works:
-#   1. Uploads rootfs.squashfs to BCM head node
-#   2. Extracts it as a BCM software image (/cm/images/kairos-image/)
-#   3. Configures node001 in cmsh (MAC, installmode=FULL, softwareimage)
-#   4. Launches compute node QEMU — BCM PXE provisions it automatically
-#   5. After provisioning, node reboots from disk into Kairos
+# BCM handles everything:
+#   1. Upload squashfs → unsquash as /cm/images/kairos-image/
+#   2. cm-create-image registers it + installs BCM node packages
+#   3. Configure node001 in cmsh (MAC, installmode=FULL, softwareimage=kairos-image)
+#   4. Launch compute VM → BCM PXE boots it → node-installer rsyncs image to disk
+#   5. Node reboots from disk → Kairos starts → stylus-agent registers with Palette
+#
+# No live boot, no direct kernel boot, no dracut hooks. BCM is the provisioner.
 #
 # Prerequisites:
-#   1. BCM head node running in KVM (launch-bcm-kvm.sh --disk or --auto)
-#   2. Kairos PXE artifacts extracted (extract-kairos-pxe.sh)
+#   - BCM head node running (launch-bcm-kvm.sh --disk or --auto)
+#   - Kairos artifacts extracted (extract-kairos-pxe.sh)
 #
 # Usage:
-#   ./test-kairos-pxe.sh [OPTIONS]
-#
-# Examples:
-#   ./test-kairos-pxe.sh                 # Deploy + launch (BCM provisions Kairos)
+#   ./test-kairos-pxe.sh                 # Deploy + launch
 #   ./test-kairos-pxe.sh --no-launch     # Deploy only, don't start VM
 #   ./test-kairos-pxe.sh --skip-upload   # Launch VM only (already deployed)
 
@@ -203,26 +201,7 @@ fi
 STYLUS_COPY
 
     echo "[5/7] Configuring image for BCM provisioning..."
-    # Must run AFTER cm-create-image, which overwrites /etc/default/grub
     ${SSH_CMD} << 'IMAGE_FIXES'
-# Enable GRUB kernel boot entries: BCM disables 10_linux so nodes always PXE boot.
-# We need native disk boot for Kairos kernel + stylus-agent.
-chmod +x /cm/images/kairos-image/etc/grub.d/10_linux 2>/dev/null && \
-    echo "[OK] Made 10_linux executable" || true
-
-# Add stylus.registration + serial console to GRUB cmdline
-GRUB_CFG="/cm/images/kairos-image/etc/default/grub"
-if [ -f "$GRUB_CFG" ]; then
-    if ! grep -q "stylus.registration" "$GRUB_CFG"; then
-        sed -i 's/GRUB_CMDLINE_LINUX="biosdevname=0/GRUB_CMDLINE_LINUX="stylus.registration biosdevname=0/' "$GRUB_CFG"
-        echo "[OK] Added stylus.registration to GRUB cmdline"
-    fi
-    if ! grep -q "console=ttyS0" "$GRUB_CFG"; then
-        sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 console=ttyS0,115200 console=tty0"/' "$GRUB_CFG"
-        echo "[OK] Added serial console to GRUB cmdline"
-    fi
-fi
-
 # Ensure ifupdown is installed: cm-create-image removes NetworkManager and masks
 # systemd-networkd, so ifupdown is the only way to bring up interfaces after disk boot.
 if ! chroot /cm/images/kairos-image which ifup &>/dev/null; then
@@ -236,6 +215,7 @@ echo "[OK] Ensured /etc/network/interfaces.d/ exists"
 
 # Enable Palette services (stylus-agent, stylus-operator)
 # In normal Kairos boot, boot stages enable these; BCM provisioning skips those.
+# Registration mode is handled by bcm-sync-userdata.sh (ExecStartPre overlay).
 WANTS="/cm/images/kairos-image/etc/systemd/system/multi-user.target.wants"
 mkdir -p "$WANTS"
 for svc in stylus-agent stylus-operator; do
@@ -260,18 +240,8 @@ done
 TEMPLATE_PATCH
 
     echo "[7/7] Configuring node001..."
-    # Configure node001 (needs variable expansion so separate heredoc)
-    ${SSH_CMD} << CMSH_SETUP
-cmsh << 'CMSH'
-device
-use node001
-set mac ${COMPUTE_MAC}
-set installmode FULL
-set softwareimage kairos-image
-commit
-CMSH
-echo "[OK] node001: MAC=${COMPUTE_MAC}, installmode=FULL, image=kairos-image"
-CMSH_SETUP
+    # Configure node001 — pipe cmsh commands via echo to avoid nested heredoc expansion issues
+    ${SSH_CMD} "echo -e 'device\nuse node001\nset mac ${COMPUTE_MAC}\nset installmode FULL\nset softwareimage kairos-image\ncommit' | cmsh && echo '[OK] node001: MAC=${COMPUTE_MAC}, installmode=FULL, image=kairos-image'"
 
     echo "[..] Waiting for ramdisk generation..."
     ${SSH_CMD} << 'WAIT_RAMDISK'
