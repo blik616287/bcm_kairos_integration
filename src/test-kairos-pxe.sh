@@ -337,7 +337,7 @@ echo ""
 # Boot order: disk first, network fallback
 # First boot: disk is empty → falls through to PXE → BCM rsyncs image + installs GRUB
 # After reboot: boots from disk → Kairos + stylus-agent registers with Palette
-exec qemu-system-x86_64 \
+qemu-system-x86_64 \
     ${KVM_FLAG} \
     -m "${COMPUTE_RAM}" \
     -smp "${COMPUTE_CPUS}" \
@@ -350,4 +350,40 @@ exec qemu-system-x86_64 \
     -vga virtio \
     -display "${QEMU_DISPLAY:-none}" \
     -serial file:"${SERIAL_LOG}" \
+    -pidfile "${PROJECT_DIR}/build/.kairos-qemu.pid" \
+    -daemonize \
     -boot order=cn
+
+echo "[..] Compute node VM started, waiting for BCM provisioning + SSH..."
+
+# Wait for node001 to be UP in BCM and SSH-reachable
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+elapsed=0
+timeout=900
+while true; do
+    # Check if QEMU is still running
+    if ! pgrep -f "qemu-system.*Kairos-ComputeNode" >/dev/null 2>&1; then
+        echo ""
+        echo "[FAIL] Compute node QEMU exited unexpectedly"
+        exit 1
+    fi
+
+    # Check if node001 is UP and SSH-reachable via BCM
+    NODE_STATUS=$(${SSH_CMD} "cmsh -c 'device; use node001; status' 2>/dev/null" 2>/dev/null || true)
+    if echo "$NODE_STATUS" | grep -q "UP"; then
+        if ${SSH_CMD} "ssh ${SSH_OPTS} -o ConnectTimeout=3 root@10.141.0.1 'echo ok'" >/dev/null 2>&1; then
+            echo ""
+            echo "[OK] Kairos compute node is UP and SSH-ready (${elapsed}s)"
+            break
+        fi
+    fi
+
+    elapsed=$((elapsed + 10))
+    if [[ $elapsed -ge $timeout ]]; then
+        echo ""
+        echo "[FAIL] Compute node not ready after ${timeout}s"
+        exit 1
+    fi
+    printf "\r  [%dm%02ds] Waiting... %s" $((elapsed / 60)) $((elapsed % 60)) "$(echo "$NODE_STATUS" | tr -d '[:space:]' | head -c 40)"
+    sleep 10
+done

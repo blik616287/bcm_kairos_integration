@@ -127,11 +127,11 @@ bcm-prepare: _require-bcm-password _require-iso ## Prepare BCM auto-install arti
 	src/prepare-bcm-autoinstall.sh --iso "$(ISO_PATH)"
 
 .PHONY: bcm-run
-bcm-run: _require-bcm-password _require-iso ## Launch BCM head node VM (auto-install, blocking)
+bcm-run: _require-bcm-password _require-iso ## Auto-install BCM, boot from disk, return when SSH ready
 	src/launch-bcm-kvm.sh --auto
 
 .PHONY: bcm-start
-bcm-start: _require-bcm-password ## Start existing BCM head node from disk (blocking)
+bcm-start: _require-bcm-password ## Boot existing BCM head node, return when SSH ready
 	src/launch-bcm-kvm.sh --disk
 
 .PHONY: bcm-stop
@@ -191,8 +191,12 @@ kairos-deploy: _require-bcm-password _require-bcm-running ## Deploy Kairos as BC
 	src/test-kairos-pxe.sh --no-launch
 
 .PHONY: kairos-run
-kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node — BCM PXE provisions Kairos (blocking)
+kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node, wait for BCM provisioning + SSH ready
 	src/test-kairos-pxe.sh --skip-upload --reset-compute
+
+.PHONY: kairos-stop
+kairos-stop: ## Kill running Kairos compute node VM
+	@pkill -f "qemu-system.*Kairos-ComputeNode" 2>/dev/null && echo "Kairos VM stopped." || echo "No Kairos VM running."
 
 .PHONY: kairos-validate
 kairos-validate: _require-bcm-password _require-bcm-running ## Validate Kairos node through BCM head node
