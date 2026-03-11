@@ -109,21 +109,20 @@ is_dirty() {
     [[ -n "${DIRTY_STEPS[$1]:-}" ]]
 }
 
-# Cascade: if a step is dirty, all downstream steps must also rebuild.
-# DAG edges:
-#   download-iso → bcm-prepare → bcm-run → kairos-deploy → kairos-run → validate
+# Cascade: if a step is dirty, downstream build steps must also rebuild.
+# bcm-run and kairos-run are live VM steps — skip if already running, never invalidated.
+# validate always runs regardless.
+# DAG edges (build-only cascade):
+#   download-iso → bcm-prepare
 #   kairos-build → kairos-extract → kairos-deploy
 cascade_dirty() {
     local changed=true
     while [[ "$changed" == "true" ]]; do
         changed=false
-        is_dirty "download-iso"   && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]]   && DIRTY_STEPS[bcm-prepare]=1   && changed=true
-        is_dirty "bcm-prepare"    && [[ -z "${DIRTY_STEPS[bcm-run]:-}" ]]       && DIRTY_STEPS[bcm-run]=1       && changed=true
-        is_dirty "bcm-run"        && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]] && DIRTY_STEPS[kairos-deploy]=1 && changed=true
-        is_dirty "kairos-build"   && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]]&& DIRTY_STEPS[kairos-extract]=1&& changed=true
-        is_dirty "kairos-extract" && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]] && DIRTY_STEPS[kairos-deploy]=1 && changed=true
-        is_dirty "kairos-deploy"  && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]]    && DIRTY_STEPS[kairos-run]=1    && changed=true
-        is_dirty "kairos-run"     && [[ -z "${DIRTY_STEPS[validate]:-}" ]]      && DIRTY_STEPS[validate]=1      && changed=true
+        is_dirty "download-iso"   && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]]    && DIRTY_STEPS[bcm-prepare]=1    && changed=true
+        is_dirty "kairos-build"   && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]] && DIRTY_STEPS[kairos-extract]=1  && changed=true
+        is_dirty "kairos-extract" && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]]  && DIRTY_STEPS[kairos-deploy]=1   && changed=true
+        is_dirty "kairos-deploy" && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]]   && DIRTY_STEPS[kairos-run]=1      && changed=true
     done
 }
 
@@ -135,8 +134,9 @@ can_skip() {
     local step="$1"
 
     # If files that affect this step have changed, force re-run
-    # (except download-iso — ISO doesn't change with code)
-    if [[ "$step" != "download-iso" ]] && is_dirty "$step"; then
+    # Exceptions: download-iso (checked by sha256), bcm-run/kairos-run (live VM state),
+    #             validate (always runs)
+    if [[ "$step" != "download-iso" && "$step" != "bcm-run" && "$step" != "validate" ]] && is_dirty "$step"; then
         return 1
     fi
 
@@ -179,7 +179,14 @@ can_skip() {
         kairos-extract)
             [[ -d "build/pxe" ]] && [[ -f "build/pxe/rootfs.squashfs" ]] && [[ -f "build/pxe/vmlinuz" ]] && [[ -f "build/pxe/user-data.yaml" ]]
             ;;
-        kairos-deploy|kairos-run|validate)
+        kairos-run)
+            # Skip if VM is already running and SSH-reachable via BCM
+            if [[ -f "build/.kairos-qemu.pid" ]] && kill -0 "$(cat build/.kairos-qemu.pid 2>/dev/null)" 2>/dev/null; then
+                return 0
+            fi
+            return 1
+            ;;
+        kairos-deploy|validate)
             return 1
             ;;
         *)
