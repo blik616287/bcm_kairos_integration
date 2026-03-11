@@ -56,6 +56,11 @@ done
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 BCM_SSH="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${SSH_PORT} root@localhost"
 
+# Filter BCM's MOTD noise from SSH command output
+filter_motd() {
+    grep -vE "cmfirstboot is still in progress|^$" || true
+}
+
 PASS=0
 FAIL=0
 WARN=0
@@ -103,7 +108,7 @@ echo ""
 # ---- Find Kairos node IP ----
 if [[ -z "$KAIROS_IP" ]]; then
     echo "[..] Auto-detecting Kairos node IP from DHCP leases..."
-    KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep '52:54:00:00:02:01' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null)
+    KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep '52:54:00:00:02:01' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd)
     if [[ -z "$KAIROS_IP" ]]; then
         echo "ERROR: Could not find Kairos node in DHCP leases."
         echo "Is the compute node running? (./test-kairos-pxe.sh --direct)"
@@ -120,7 +125,7 @@ echo "[..] Testing SSH to Kairos node (root@${KAIROS_IP})..."
 KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
 
 # Test SSH connectivity
-SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null || true)
+SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
 if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
     echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
     echo "SSH output: ${SSH_TEST}"
@@ -177,7 +182,7 @@ grep kairos /etc/passwd 2>/dev/null || echo MISSING
 echo \"===ISSUE===\"
 cat /etc/issue 2>/dev/null || echo MISSING
 echo \"===END===\"
-'" 2>/dev/null)
+'" 2>/dev/null | filter_motd)
 
 # Parse results
 get_section() {
@@ -256,7 +261,7 @@ else
 fi
 
 # Check cmd (BCM compute daemon)
-if echo "$SERVICES" | grep -q "cmd.*running" || ${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'systemctl is-active cmd'" 2>/dev/null | grep -q "active"; then
+if echo "$SERVICES" | grep -q "cmd.*running" || ${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
     check "cmd service" "PASS" "active"
 else
     check "cmd service" "FAIL" "not running"
@@ -268,7 +273,7 @@ echo "-- User Config --"
 check "SSH login" "PASS" "root@${KAIROS_IP} (via BCM head node)"
 
 # Check user-data was applied
-USERDATA_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null || true)
+USERDATA_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null | filter_motd || true)
 if [[ "$USERDATA_CHECK" == *"present"* ]]; then
     check "user-data" "PASS" "/oem/99_userdata.yaml present"
 else
@@ -276,7 +281,7 @@ else
 fi
 
 # Check Palette registration
-REG_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager | grep -c \"Registration completed\"'" 2>/dev/null || echo "0")
+REG_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager | grep -c \"Registration completed\"'" 2>/dev/null | filter_motd || echo "0")
 if [[ "$REG_CHECK" -gt 0 ]] 2>/dev/null; then
     check "Palette registration" "PASS" "registered"
 else

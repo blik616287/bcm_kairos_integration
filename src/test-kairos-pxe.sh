@@ -103,6 +103,12 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 SSH_CMD="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${SSH_PORT} root@localhost"
 SCP_CMD="sshpass -p ${BCM_PASSWORD} scp -O ${SSH_OPTS} -P ${SSH_PORT}"
 
+# Filter BCM's MOTD noise from SSH command output.
+# cmfirstboot injects messages into .bashrc that pollute every SSH stdout.
+filter_motd() {
+    grep -vE "cmfirstboot is still in progress|^$" || true
+}
+
 # ---- Preflight ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
     if [[ ! -f "${PXE_DIR}/rootfs.squashfs" ]]; then
@@ -140,7 +146,7 @@ echo "[OK] BCM head node is reachable"
 echo "[..] Waiting for cmfirstboot to complete..."
 elapsed=0
 while true; do
-    CMFB_STATUS=$(${SSH_CMD} "systemctl is-active cmfirstboot" 2>/dev/null || echo "unknown")
+    CMFB_STATUS=$(${SSH_CMD} "systemctl is-active cmfirstboot" 2>/dev/null | filter_motd || echo "unknown")
     if [[ "$CMFB_STATUS" != "activating" && "$CMFB_STATUS" != "active" ]]; then
         break
     fi
@@ -151,32 +157,34 @@ done
 echo ""
 
 # Verify cmfirstboot completed successfully (not failed)
-CMFB_RESULT=$(${SSH_CMD} "systemctl show cmfirstboot --property=Result --value" 2>/dev/null || echo "unknown")
+CMFB_RESULT=$(${SSH_CMD} "systemctl show cmfirstboot --property=Result --value" 2>/dev/null | filter_motd || echo "unknown")
 if [[ "$CMFB_RESULT" != "success" ]]; then
     echo "[WARN] cmfirstboot result: ${CMFB_RESULT}"
 fi
 echo "[OK] cmfirstboot complete"
 
-# Wait for key BCM services to be ready (cmd, CMDaemon)
-echo "[..] Waiting for BCM services..."
+# Wait for key BCM services to be ready
+# BCM's main daemon is "cmd" (Cluster Management Daemon). Also check cmsh is responsive.
+echo "[..] Waiting for BCM services (cmd + cmsh)..."
 elapsed=0
 while true; do
-    CMD_STATUS=$(${SSH_CMD} "systemctl is-active cmd" 2>/dev/null || echo "inactive")
-    CMDAEMON_STATUS=$(${SSH_CMD} "systemctl is-active cmdaemon" 2>/dev/null || echo "inactive")
-    if [[ "$CMD_STATUS" == "active" ]] && [[ "$CMDAEMON_STATUS" == "active" ]]; then
+    CMD_STATUS=$(${SSH_CMD} "systemctl is-active cmd" 2>/dev/null | filter_motd || echo "inactive")
+    # Verify cmsh can actually talk to the daemon (not just that systemd says active)
+    CMSH_OK=$(${SSH_CMD} "cmsh -c 'main; status' >/dev/null 2>&1 && echo ok || echo no" 2>/dev/null | filter_motd || echo "no")
+    if [[ "$CMD_STATUS" == "active" ]] && [[ "$CMSH_OK" == "ok" ]]; then
         break
     fi
     elapsed=$((elapsed + 5))
     if [[ $elapsed -ge 300 ]]; then
         echo ""
-        echo "ERROR: BCM services not ready after 5 minutes (cmd=${CMD_STATUS}, cmdaemon=${CMDAEMON_STATUS})"
+        echo "ERROR: BCM services not ready after 5 minutes (cmd=${CMD_STATUS}, cmsh=${CMSH_OK})"
         exit 1
     fi
-    printf "\r  [%dm%02ds] cmd=%s cmdaemon=%s" $((elapsed / 60)) $((elapsed % 60)) "$CMD_STATUS" "$CMDAEMON_STATUS"
+    printf "\r  [%dm%02ds] cmd=%s cmsh=%s" $((elapsed / 60)) $((elapsed % 60)) "$CMD_STATUS" "$CMSH_OK"
     sleep 5
 done
 echo ""
-echo "[OK] BCM services ready (cmd + cmdaemon active)"
+echo "[OK] BCM services ready (cmd active, cmsh responsive)"
 
 # ---- Deploy Kairos as BCM software image ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
@@ -187,11 +195,11 @@ if [[ "$SKIP_UPLOAD" != "true" ]]; then
 
     # Check if image already exists and is current
     EXTRACTED=false
-    EXISTING=$(${SSH_CMD} "ls -d /cm/images/kairos-image 2>/dev/null && echo yes || echo no")
+    EXISTING=$(${SSH_CMD} "ls -d /cm/images/kairos-image 2>/dev/null && echo yes || echo no" | filter_motd)
     if [[ "$EXISTING" == "yes" ]]; then
         echo "[..] kairos-image already exists, checking if squashfs is newer..."
         LOCAL_SIZE=$(stat -c%s "${PXE_DIR}/rootfs.squashfs")
-        REMOTE_MARKER=$(${SSH_CMD} "cat /cm/images/kairos-image/.squashfs-size 2>/dev/null || echo 0")
+        REMOTE_MARKER=$(${SSH_CMD} "cat /cm/images/kairos-image/.squashfs-size 2>/dev/null || echo 0" | filter_motd)
         if [[ "$LOCAL_SIZE" == "$REMOTE_MARKER" ]]; then
             echo "[OK] kairos-image is up to date, skipping extraction"
         else
@@ -206,9 +214,9 @@ if [[ "$SKIP_UPLOAD" != "true" ]]; then
         ${SCP_CMD} "${PXE_DIR}/rootfs.squashfs" root@localhost:/tmp/kairos-rootfs.squashfs
 
         echo "[2/7] Extracting to /cm/images/kairos-image/..."
-        ${SSH_CMD} "rm -rf /cm/images/kairos-image && unsquashfs -d /cm/images/kairos-image /tmp/kairos-rootfs.squashfs && rm -f /tmp/kairos-rootfs.squashfs"
+        ${SSH_CMD} "rm -rf /cm/images/kairos-image && unsquashfs -d /cm/images/kairos-image /tmp/kairos-rootfs.squashfs && rm -f /tmp/kairos-rootfs.squashfs" | filter_motd
         LOCAL_SIZE=$(stat -c%s "${PXE_DIR}/rootfs.squashfs")
-        ${SSH_CMD} "echo ${LOCAL_SIZE} > /cm/images/kairos-image/.squashfs-size"
+        ${SSH_CMD} "echo ${LOCAL_SIZE} > /cm/images/kairos-image/.squashfs-size" | filter_motd
     else
         echo "[1/7] Upload: skipped (image up to date)"
         echo "[2/7] Extract: skipped (image up to date)"
@@ -219,7 +227,7 @@ if [[ "$SKIP_UPLOAD" != "true" ]]; then
     if [[ "$EXTRACTED" == "true" ]]; then
         # Image was re-extracted — must re-run cm-create-image to reinstall BCM packages
         # Use -u (update) if image already registered, otherwise create fresh
-        ${SSH_CMD} << 'CM_CREATE'
+        ${SSH_CMD} << 'CM_CREATE' | filter_motd
 if cmsh -c "softwareimage; use kairos-image" 2>/dev/null; then
     echo "Updating existing kairos-image registration..."
     cm-create-image -d /cm/images/kairos-image --minimal --skipdist -n kairos-image -g public -u -f 2>&1 | tail -5
@@ -230,7 +238,7 @@ fi
 echo "[OK] kairos-image registered via cm-create-image"
 CM_CREATE
     else
-        ${SSH_CMD} << 'CM_CREATE'
+        ${SSH_CMD} << 'CM_CREATE' | filter_motd
 if cmsh -c "softwareimage; use kairos-image" 2>/dev/null; then
     echo "[OK] kairos-image already registered in cmsh"
 else
@@ -247,7 +255,7 @@ CM_CREATE
     # which crashes on auth failure and poisons Palette rate limits.
     # Without it, the agent enters registration mode and retries properly.
     # After successful registration, stylus-agent creates its own config files.
-    ${SSH_CMD} << 'STYLUS_CHECK'
+    ${SSH_CMD} << 'STYLUS_CHECK' | filter_motd
 if [ -f /cm/images/kairos-image/oem/80_stylus.yaml ]; then
     rm -f /cm/images/kairos-image/oem/80_stylus.yaml
     echo "[OK] Removed 80_stylus.yaml from /oem/ (prevents upgrade-path crash)"
@@ -257,7 +265,7 @@ fi
 STYLUS_CHECK
 
     echo "[5/7] Configuring image for BCM provisioning..."
-    ${SSH_CMD} << 'IMAGE_FIXES'
+    ${SSH_CMD} << 'IMAGE_FIXES' | filter_motd
 # Ensure ifupdown is installed: cm-create-image removes NetworkManager and masks
 # systemd-networkd, so ifupdown is the only way to bring up interfaces after disk boot.
 if ! chroot /cm/images/kairos-image which ifup &>/dev/null; then
@@ -286,7 +294,7 @@ IMAGE_FIXES
     echo "[6/7] Patching PXE template..."
     # IPAPPEND 2 (BOOTIF only, no ip= injection)
     # BCM's default IPAPPEND 3 injects ip= which conflicts with the node-installer
-    ${SSH_CMD} << 'TEMPLATE_PATCH'
+    ${SSH_CMD} << 'TEMPLATE_PATCH' | filter_motd
 for tmpl in /tftpboot/pxelinux.cfg/template /tftpboot/x86_64/bios/pxelinux.cfg/template; do
     if [ -f "$tmpl" ] && grep -q "IPAPPEND 3" "$tmpl"; then
         sed -i 's/IPAPPEND 3/IPAPPEND 2/g' "$tmpl"
@@ -297,10 +305,10 @@ TEMPLATE_PATCH
 
     echo "[7/7] Configuring node001..."
     # Configure node001 — pipe cmsh commands via echo to avoid nested heredoc expansion issues
-    ${SSH_CMD} "echo -e 'device\nuse node001\nset mac ${COMPUTE_MAC}\nset installmode FULL\nset softwareimage kairos-image\ncommit' | cmsh && echo '[OK] node001: MAC=${COMPUTE_MAC}, installmode=FULL, image=kairos-image'"
+    ${SSH_CMD} "echo -e 'device\nuse node001\nset mac ${COMPUTE_MAC}\nset installmode FULL\nset softwareimage kairos-image\ncommit' | cmsh && echo '[OK] node001: MAC=${COMPUTE_MAC}, installmode=FULL, image=kairos-image'" | filter_motd
 
     echo "[..] Waiting for ramdisk generation..."
-    ${SSH_CMD} << 'WAIT_RAMDISK'
+    ${SSH_CMD} << 'WAIT_RAMDISK' | filter_motd
 KERNEL_VER=$(cmsh -c "softwareimage; use kairos-image; get kernelversion" 2>/dev/null)
 INITRD="/cm/images/kairos-image/boot/initrd.cm.img-${KERNEL_VER}"
 for i in $(seq 1 60); do
@@ -411,7 +419,7 @@ while true; do
     fi
 
     # Check if node001 is UP and SSH-reachable via BCM
-    NODE_STATUS=$(${SSH_CMD} "cmsh -c 'device; use node001; status' 2>/dev/null" 2>/dev/null || true)
+    NODE_STATUS=$(${SSH_CMD} "cmsh -c 'device; use node001; status' 2>/dev/null" 2>/dev/null | filter_motd || true)
     if echo "$NODE_STATUS" | grep -q "UP"; then
         if ${SSH_CMD} "ssh ${SSH_OPTS} -o ConnectTimeout=3 root@10.141.0.1 'echo ok'" >/dev/null 2>&1; then
             echo ""
@@ -436,7 +444,7 @@ NODE_SSH="${SSH_CMD} \"ssh ${SSH_OPTS} root@10.141.0.1\""
 FAIL=false
 
 # Check cmd service
-if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active cmd'" 2>/dev/null | grep -q "active"; then
+if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
     echo "[OK] cmd service is active"
 else
     echo "[FAIL] cmd service is not active"
@@ -444,7 +452,7 @@ else
 fi
 
 # Check stylus-agent service
-if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active stylus-agent'" 2>/dev/null | grep -q "active"; then
+if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active stylus-agent'" 2>/dev/null | filter_motd | grep -q "active"; then
     echo "[OK] stylus-agent is active"
 else
     echo "[FAIL] stylus-agent is not active"
@@ -456,7 +464,7 @@ echo "[..] Waiting for Palette registration..."
 reg_elapsed=0
 reg_timeout=300
 while true; do
-    if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | grep -q "Registration completed"; then
+    if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd | grep -q "Registration completed"; then
         echo "[OK] Palette registration completed"
         break
     fi
