@@ -136,7 +136,13 @@ bcm-start: _require-bcm-password ## Boot existing BCM head node, return when SSH
 
 .PHONY: bcm-stop
 bcm-stop: ## Kill running BCM head node VM
-	@pkill -f "qemu-system.*BCM-11.0" 2>/dev/null && echo "BCM VM stopped." || echo "No BCM VM running."
+	@if [ -f build/.bcm-qemu.pid ] && kill $$(cat build/.bcm-qemu.pid) 2>/dev/null; then \
+		rm -f build/.bcm-qemu.pid; \
+		echo "BCM VM stopped."; \
+	else \
+		rm -f build/.bcm-qemu.pid; \
+		echo "No BCM VM running."; \
+	fi
 
 # ---- Kairos Build & Extract ----
 
@@ -196,7 +202,13 @@ kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node, w
 
 .PHONY: kairos-stop
 kairos-stop: ## Kill running Kairos compute node VM
-	@pkill -f "qemu-system.*Kairos-ComputeNode" 2>/dev/null && echo "Kairos VM stopped." || echo "No Kairos VM running."
+	@if [ -f build/.kairos-qemu.pid ] && kill $$(cat build/.kairos-qemu.pid) 2>/dev/null; then \
+		rm -f build/.kairos-qemu.pid; \
+		echo "Kairos VM stopped."; \
+	else \
+		rm -f build/.kairos-qemu.pid; \
+		echo "No Kairos VM running."; \
+	fi
 
 .PHONY: kairos-validate
 kairos-validate: _require-bcm-password _require-bcm-running ## Validate Kairos node through BCM head node
