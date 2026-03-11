@@ -31,6 +31,7 @@ ISO="${ISO_PATH:-${PROJECT_DIR}/dist/bcm-11.0-ubuntu2404.iso}"
 
 # Output artifacts
 BUILD_DIR="${PROJECT_DIR}/build"
+mkdir -p "${BUILD_DIR}"
 OUT_KERNEL="${BUILD_DIR}/.bcm-kernel"
 OUT_ROOTFS="${BUILD_DIR}/.bcm-rootfs-auto.cgz"
 OUT_INITIMG="${BUILD_DIR}/.bcm-init.img"
