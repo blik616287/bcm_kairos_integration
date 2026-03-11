@@ -65,13 +65,84 @@ log_file() {
     echo "${LOG_DIR}/orchestrate-${1}.log"
 }
 
+# ---- Dirty file detection ----
+# Maps uncommitted file changes to the steps they would invalidate.
+# Populates DIRTY_STEPS associative array.
+declare -A DIRTY_STEPS
+
+detect_dirty_steps() {
+    # Collect all uncommitted changes (staged, unstaged, untracked)
+    local changed
+    changed=$(
+        git diff --name-only HEAD 2>/dev/null
+        git diff --name-only --cached 2>/dev/null
+        git ls-files --others --exclude-standard 2>/dev/null
+    ) || true
+
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        case "$file" in
+            src/prepare-bcm-autoinstall.sh)
+                DIRTY_STEPS[bcm-prepare]=1; DIRTY_STEPS[bcm-run]=1 ;;
+            src/launch-bcm-kvm.sh)
+                DIRTY_STEPS[bcm-run]=1 ;;
+            src/build-canvos.sh|src/canvos/*|src/canvos/**)
+                DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1 ;;
+            CanvOS|CanvOS/*)
+                DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1 ;;
+            src/extract-kairos-pxe.sh)
+                DIRTY_STEPS[kairos-extract]=1 ;;
+            src/test-kairos-pxe.sh)
+                DIRTY_STEPS[kairos-deploy]=1; DIRTY_STEPS[kairos-run]=1 ;;
+            src/validate-kairos.sh)
+                DIRTY_STEPS[validate]=1 ;;
+            Makefile)
+                DIRTY_STEPS[bcm-prepare]=1; DIRTY_STEPS[bcm-run]=1
+                DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1
+                DIRTY_STEPS[kairos-deploy]=1 ;;
+            env.json)
+                DIRTY_STEPS[download-iso]=1; DIRTY_STEPS[kairos-extract]=1
+                DIRTY_STEPS[kairos-deploy]=1 ;;
+        esac
+    done <<< "$changed"
+}
+
+is_dirty() {
+    [[ -n "${DIRTY_STEPS[$1]:-}" ]]
+}
+
 # ---- Skip detection ----
-# Returns 0 (true) if a step can be skipped based on existing artifacts.
+# Returns 0 (true) if a step can be skipped.
+# A step is skipped only if artifacts exist AND no uncommitted changes affect it.
+# Exception: download-iso only checks file existence + size (never invalidated by code changes).
 can_skip() {
     local step="$1"
+
+    # If files that affect this step have changed, force re-run
+    # (except download-iso — ISO doesn't change with code)
+    if [[ "$step" != "download-iso" ]] && is_dirty "$step"; then
+        return 1
+    fi
+
     case "$step" in
         download-iso)
-            [[ -f "dist/${ISO_FILENAME}" ]] && [[ $(stat -c%s "dist/${ISO_FILENAME}" 2>/dev/null || echo 0) -gt 1000000 ]]
+            # Skip if ISO exists and is roughly the right size
+            if [[ -f "dist/${ISO_FILENAME}" ]]; then
+                local actual_size
+                actual_size=$(stat -c%s "dist/${ISO_FILENAME}" 2>/dev/null || echo 0)
+                if [[ "$ISO_TOTAL_MB" -gt 0 ]]; then
+                    # Within 1% of expected size
+                    local expected_bytes=$(( ISO_TOTAL_MB * 1048576 ))
+                    local threshold=$(( expected_bytes / 100 ))
+                    local diff=$(( actual_size - expected_bytes ))
+                    [[ ${diff#-} -lt $threshold ]]
+                else
+                    # No expected size known — skip if >100MB (not a truncated download)
+                    [[ "$actual_size" -gt 104857600 ]]
+                fi
+            else
+                return 1
+            fi
             ;;
         bcm-prepare)
             [[ -f "build/.bcm-kernel" ]] && [[ -f "build/.bcm-rootfs-auto.cgz" ]] && [[ -f "build/.bcm-init.img" ]]
@@ -80,12 +151,10 @@ can_skip() {
             # Skip if disk exists AND BCM VM is already SSH-reachable
             if [[ -f "build/bcm-disk.qcow2" ]]; then
                 if [[ -f "build/.bcm-qemu.pid" ]] && kill -0 "$(cat build/.bcm-qemu.pid 2>/dev/null)" 2>/dev/null; then
-                    # VM running — check SSH
                     sshpass -p "${BCM_PASSWORD:-}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                         -o LogLevel=ERROR -o ConnectTimeout=3 -p 10022 root@localhost "echo ok" >/dev/null 2>&1
                     return $?
                 fi
-                # Disk exists but VM not running — need to start it (use bcm-start instead)
                 return 1
             fi
             return 1
@@ -97,7 +166,6 @@ can_skip() {
             [[ -d "build/pxe" ]] && [[ -f "build/pxe/rootfs.squashfs" ]] && [[ -f "build/pxe/vmlinuz" ]] && [[ -f "build/pxe/user-data.yaml" ]]
             ;;
         kairos-deploy|kairos-run|validate)
-            # These depend on live VM state — never skip
             return 1
             ;;
         *)
@@ -281,21 +349,51 @@ if [[ "$FORCE_CLEAN" == "true" ]]; then
     echo -e "${GREEN}[DONE]${NC} clean-all"
 fi
 
+# ---- Detect uncommitted changes ----
+detect_dirty_steps
+
 # ---- Pre-flight skip detection ----
 banner "Checking existing artifacts"
+
+# Show dirty files if any
+if [[ ${#DIRTY_STEPS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}Uncommitted changes detected affecting:${NC}"
+    for s in "${!DIRTY_STEPS[@]}"; do
+        echo -e "  ${YELLOW}→ ${s}${NC} (will rebuild)"
+    done
+    echo ""
+fi
+
 SKIPPABLE=0
 for s in "${ALL_STEPS[@]}"; do
     if can_skip "$s"; then
-        echo -e "  ${CYAN}⏭️  ${s}${NC} — artifacts present, will skip"
+        echo -e "  ⏭️  ${CYAN}${s}${NC} — skip (artifacts present, no changes)"
         SKIPPABLE=$((SKIPPABLE + 1))
+    elif is_dirty "$s" && [[ "$s" != "download-iso" ]]; then
+        echo -e "  🔄 ${YELLOW}${s}${NC} — rebuild (uncommitted changes)"
     else
         echo -e "  ⏳ ${s} — needs to run"
     fi
 done
 echo ""
 if [[ $SKIPPABLE -gt 0 ]]; then
-    echo -e "${YELLOW}Skipping ${SKIPPABLE} step(s) with existing artifacts. Use --clean to force rebuild.${NC}"
+    echo -e "Skipping ${SKIPPABLE} step(s). Use --clean to force full rebuild."
 fi
+
+# Clean artifacts for dirty steps so they rebuild cleanly
+for s in "${!DIRTY_STEPS[@]}"; do
+    case "$s" in
+        bcm-prepare)
+            rm -f build/.bcm-kernel build/.bcm-rootfs-auto.cgz build/.bcm-init.img ;;
+        bcm-run)
+            # Don't delete disk — bcm-run will handle reinstall vs restart
+            ;;
+        kairos-build)
+            rm -f build/palette-edge-installer.iso ;;
+        kairos-extract)
+            rm -rf build/pxe/ ;;
+    esac
+done
 
 # ════════════════════════════════════════════════
 #  Phase 1: Parallel — BCM track + Kairos track
