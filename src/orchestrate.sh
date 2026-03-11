@@ -74,10 +74,10 @@ detect_dirty_steps() {
     # Collect all uncommitted changes (staged, unstaged, untracked)
     local changed
     changed=$(
-        git diff --name-only HEAD 2>/dev/null
-        git diff --name-only --cached 2>/dev/null
-        git ls-files --others --exclude-standard 2>/dev/null
-    ) || true
+        { git diff --name-only HEAD 2>/dev/null || true; }
+        { git diff --name-only --cached 2>/dev/null || true; }
+        { git ls-files --others --exclude-standard 2>/dev/null || true; }
+    )
 
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
@@ -119,10 +119,10 @@ cascade_dirty() {
     local changed=true
     while [[ "$changed" == "true" ]]; do
         changed=false
-        is_dirty "download-iso"   && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]]    && DIRTY_STEPS[bcm-prepare]=1    && changed=true
-        is_dirty "kairos-build"   && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]] && DIRTY_STEPS[kairos-extract]=1  && changed=true
-        is_dirty "kairos-extract" && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]]  && DIRTY_STEPS[kairos-deploy]=1   && changed=true
-        is_dirty "kairos-deploy" && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]]   && DIRTY_STEPS[kairos-run]=1      && changed=true
+        if is_dirty "download-iso"   && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]];    then DIRTY_STEPS[bcm-prepare]=1;    changed=true; fi
+        if is_dirty "kairos-build"   && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]]; then DIRTY_STEPS[kairos-extract]=1;  changed=true; fi
+        if is_dirty "kairos-extract" && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]];  then DIRTY_STEPS[kairos-deploy]=1;   changed=true; fi
+        if is_dirty "kairos-deploy"  && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]];     then DIRTY_STEPS[kairos-run]=1;      changed=true; fi
     done
 }
 
