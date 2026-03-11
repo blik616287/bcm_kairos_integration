@@ -37,8 +37,9 @@ ISO_FILENAME      := $(or $(call jq,.iso_filename),bcm-11.0-ubuntu2404.iso)
 ISO_PATH          := dist/$(ISO_FILENAME)
 
 # Export common env vars for scripts
+PALETTE_PROJECT_UID := $(PALETTE_PROJECT)
 export BCM_PASSWORD BCM_HOSTNAME BCM_TIMEZONE
-export PALETTE_ENDPOINT PALETTE_TOKEN PALETTE_PROJECT_UID=$(PALETTE_PROJECT)
+export PALETTE_ENDPOINT PALETTE_TOKEN PALETTE_PROJECT_UID
 export ISO_PATH
 
 # SSH options (reused across targets)
@@ -112,7 +113,7 @@ download-iso: _require-jfrog ## Download BCM ISO from JFrog to dist/
 		echo "Delete it first to re-download."; \
 	else \
 		echo "Downloading $(ISO_FILENAME) from $(JFROG_INSTANCE)..."; \
-		curl --fail --progress-bar \
+		curl --fail --location --progress-bar \
 			-H "Authorization: Bearer $(JFROG_TOKEN)" \
 			-o "$(ISO_PATH)" \
 			"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
@@ -165,7 +166,7 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 	@elapsed=0; \
 	while true; do \
 		KAIROS_IP=$$(sshpass -p "$(BCM_PASSWORD)" ssh $(SSH_OPTS) -p 10022 root@localhost \
-			"grep -oP '10\\.141\\.[0-9]+\\.[0-9]+' /var/lib/misc/dnsmasq.leases 2>/dev/null | head -1" 2>/dev/null); \
+			"grep -oP '(?<=lease )10\\.141\\.[0-9]+\\.[0-9]+' /var/lib/dhcpd/dhcpd.leases 2>/dev/null | tail -1" 2>/dev/null); \
 		if [ -n "$$KAIROS_IP" ]; then \
 			if sshpass -p "$(BCM_PASSWORD)" ssh $(SSH_OPTS) -p 10022 root@localhost \
 				"sshpass -p kairos ssh $(SSH_OPTS) -o ConnectTimeout=3 kairos@$$KAIROS_IP 'echo ok'" >/dev/null 2>&1; then \
@@ -186,12 +187,12 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 # ---- Kairos Deploy & Test ----
 
 .PHONY: kairos-deploy
-kairos-deploy: _require-bcm-password _require-bcm-running ## Upload PXE artifacts to BCM head node
+kairos-deploy: _require-bcm-password _require-bcm-running ## Deploy Kairos as BCM software image (upload + configure)
 	src/test-kairos-pxe.sh --no-launch
 
 .PHONY: kairos-run
-kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node VM (direct kernel boot, blocking)
-	src/test-kairos-pxe.sh --skip-upload --direct
+kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node — BCM PXE provisions Kairos (blocking)
+	src/test-kairos-pxe.sh --skip-upload --reset-compute
 
 .PHONY: kairos-validate
 kairos-validate: _require-bcm-password _require-bcm-running ## Validate Kairos node through BCM head node

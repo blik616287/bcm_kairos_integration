@@ -282,29 +282,34 @@ for part in \$(ls /dev/mapper/*-root /dev/mapper/*root 2>/dev/null) \
 done
 
 if [ -n "\$INSTALLED_ROOT" ]; then
-    # Add net.ifnames=0 to GRUB_CMDLINE_LINUX (BCM already sets biosdevname=0)
+    # Add net.ifnames=0 to GRUB_CMDLINE_LINUX for future update-grub runs
     if ! grep -q "net.ifnames=0" /mnt/installed/etc/default/grub; then
         sed -i 's/biosdevname=0/net.ifnames=0 biosdevname=0/' \
             /mnt/installed/etc/default/grub
         echo "[OK] Patched /etc/default/grub"
     fi
-    # Also patch grub.cfg directly (in case update-grub fails in chroot)
-    if [ -f /mnt/installed/boot/grub/grub.cfg ]; then
-        if ! grep -q "net.ifnames=0" /mnt/installed/boot/grub/grub.cfg; then
-            sed -i 's/biosdevname=0/net.ifnames=0 biosdevname=0/g' \
-                /mnt/installed/boot/grub/grub.cfg
+
+    # Mount the boot partition at /mnt/installed/boot (BCM uses a separate boot partition)
+    BOOT_PART=""
+    for bp in /dev/vda1 /dev/sda1; do
+        if [ -b "\$bp" ]; then
+            mount "\$bp" /mnt/installed/boot 2>/dev/null && BOOT_PART="\$bp" && break
         fi
-        echo "[OK] Patched /boot/grub/grub.cfg"
+    done
+
+    # Patch grub.cfg directly — do NOT run update-grub, it strips net.ifnames=0
+    if [ -f /mnt/installed/boot/grub/grub.cfg ]; then
+        sed -i 's/biosdevname=0/net.ifnames=0 biosdevname=0/g' \
+            /mnt/installed/boot/grub/grub.cfg
+        echo "[OK] Patched /boot/grub/grub.cfg on \${BOOT_PART:-boot partition}"
+    else
+        echo "[WARN] /boot/grub/grub.cfg not found"
+        ls -la /mnt/installed/boot/ 2>/dev/null || true
     fi
-    # Try update-grub in chroot
-    mount --bind /dev /mnt/installed/dev 2>/dev/null
-    mount --bind /proc /mnt/installed/proc 2>/dev/null
-    mount --bind /sys /mnt/installed/sys 2>/dev/null
-    chroot /mnt/installed update-grub 2>/dev/null || \
-        chroot /mnt/installed grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
-    umount /mnt/installed/sys /mnt/installed/proc /mnt/installed/dev 2>/dev/null
+
+    [ -n "\$BOOT_PART" ] && umount /mnt/installed/boot 2>/dev/null
     umount /mnt/installed 2>/dev/null
-    echo "[OK] GRUB updated: net.ifnames=0 biosdevname=0"
+    echo "[OK] GRUB patched: net.ifnames=0 biosdevname=0"
 else
     echo "[WARN] Could not find installed root partition to patch GRUB"
     echo "[WARN] Listing all block devices for debugging:"

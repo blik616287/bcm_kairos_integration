@@ -130,6 +130,16 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
         cp -r "${SCRIPT_DIR}/canvos/overlay/"* "${CANVOS_DIR}/overlay/" 2>/dev/null || true
     fi
 
+    # Patch Earthfile to add BCM-required packages
+    # wget: BCM's wait_cmd uses it to health-check the cmd daemon
+    # initramfs-tools: BCM needs it to generate node ramdisks
+    # ifupdown: BCM removes NetworkManager and masks systemd-networkd; needs ifupdown for networking
+    if ! grep -q 'wget' "${CANVOS_DIR}/Earthfile"; then
+        echo "Patching Earthfile: adding wget, initramfs-tools, ifupdown..."
+        sed -i 's/apt-get install --no-install-recommends kbd/apt-get install --no-install-recommends wget initramfs-tools ifupdown kbd/' \
+            "${CANVOS_DIR}/Earthfile"
+    fi
+
     echo "[1/2] Running CanvOS build (this may take a while)..."
     cd "${CANVOS_DIR}"
     ./earthly.sh +iso --ARCH="${ARCH}"

@@ -36,6 +36,10 @@ PALETTE_ENDPOINT="${PALETTE_ENDPOINT:-api.spectrocloud.com}"
 PALETTE_TOKEN="${PALETTE_TOKEN:?ERROR: PALETTE_TOKEN not set. Set in env.json or export PALETTE_TOKEN}"
 PALETTE_PROJECT_UID="${PALETTE_PROJECT_UID:?ERROR: PALETTE_PROJECT_UID not set. Set in env.json or export PALETTE_PROJECT_UID}"
 
+# Edge host name — used as both the Palette edge ID and system hostname.
+# Keeps BCM and Palette in sync (BCM knows this node by the same name).
+EDGE_HOST_NAME="${EDGE_HOST_NAME:-node001}"
+
 usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
@@ -45,6 +49,7 @@ Extracts PXE boot artifacts from a Kairos ISO.
 Options:
   --iso PATH           Path to Kairos ISO (default: build/palette-edge-installer.iso)
   --output-dir DIR     Output directory (default: build/pxe/)
+  --edge-name NAME     Edge host name for Palette + BCM (default: node001)
   --head-ip IP         BCM head node internal IP (default: 10.141.255.254)
   --http-port PORT     HTTP server port on head node (default: 8888)
   --clean              Remove existing PXE artifacts first
@@ -67,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --iso)          ISO_PATH="$2"; shift 2 ;;
         --output-dir)   OUTPUT_DIR="$2"; shift 2 ;;
+        --edge-name)    EDGE_HOST_NAME="$2"; shift 2 ;;
         --head-ip)      HEAD_NODE_IP="$2"; shift 2 ;;
         --http-port)    HTTP_PORT="$2"; shift 2 ;;
         --clean)        CLEAN=true; shift ;;
@@ -166,6 +172,7 @@ stylus:
     paletteEndpoint: ${PALETTE_ENDPOINT}
     edgeHostToken: ${PALETTE_TOKEN}
     projectUid: ${PALETTE_PROJECT_UID}
+    name: ${EDGE_HOST_NAME}
 
 # Auto-install to local disk on PXE boot
 install:
@@ -236,6 +243,7 @@ mkdir -p "${OVERLAY_DIR}/oem"
 cp "${OUTPUT_DIR}/user-data.yaml" "${OVERLAY_DIR}/oem/99_userdata.yaml"
 
 # Add dracut pre-pivot hook to copy /oem into /sysroot/oem before switch_root
+# and inject a systemd service for auto-install (boot stages don't run with boot_mode=unknown)
 mkdir -p "${OVERLAY_DIR}/usr/lib/dracut/hooks/pre-pivot"
 cat > "${OVERLAY_DIR}/usr/lib/dracut/hooks/pre-pivot/99-copy-oem-userdata.sh" <<'HOOK'
 #!/bin/sh
@@ -247,12 +255,29 @@ if [ -f /oem/99_userdata.yaml ]; then
     echo "kairos-pxe: copied user-data to /sysroot/oem/99_userdata.yaml"
 fi
 
-# Create /run/cos/live_mode sentinel so kairos-agent detects live boot mode.
-# Without this, boot_mode=unknown and the installer/registration flow is skipped.
-# Normally immucore creates this, but rd.cos.disable prevents immucore from running.
-mkdir -p /run/cos
-touch /run/cos/live_mode
-echo "kairos-pxe: created /run/cos/live_mode sentinel for live boot detection"
+# Inject auto-install systemd service into the live rootfs.
+# With rd.cos.disable, immucore sets boot_mode=unknown (overwrites any sentinel),
+# which prevents kairos-agent from running user-defined boot stages.
+# This service triggers manual-install directly via systemd instead.
+mkdir -p /sysroot/etc/systemd/system/multi-user.target.wants
+printf '%s\n' \
+    '[Unit]' \
+    'Description=Kairos Auto Install to Disk' \
+    'After=network-online.target kairos-agent.service' \
+    'Wants=network-online.target' \
+    'ConditionPathExists=!/dev/disk/by-label/COS_ACTIVE' \
+    '' \
+    '[Service]' \
+    'Type=oneshot' \
+    'ExecStart=/usr/bin/kairos-agent manual-install --device auto --reboot /oem/99_userdata.yaml' \
+    'StandardOutput=journal+console' \
+    'StandardError=journal+console' \
+    'TimeoutSec=infinity' \
+    > /sysroot/etc/systemd/system/kairos-auto-install.service
+
+ln -sf /etc/systemd/system/kairos-auto-install.service \
+    /sysroot/etc/systemd/system/multi-user.target.wants/kairos-auto-install.service
+echo "kairos-pxe: created auto-install systemd service"
 HOOK
 chmod +x "${OVERLAY_DIR}/usr/lib/dracut/hooks/pre-pivot/99-copy-oem-userdata.sh"
 

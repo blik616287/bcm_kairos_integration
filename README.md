@@ -112,43 +112,59 @@ cp env.json.example env.json
 
 ## Make Targets
 
-```
-Setup
-  setup                 Check all prerequisites are installed
+Targets are listed in the order they would typically be run during a full end-to-end deployment.
 
-Download
-  download-iso          Download BCM ISO from JFrog to dist/
+### Setup & Download
 
-BCM Head Node
-  bcm-prepare           Prepare auto-install artifacts from ISO
-  bcm-run               Auto-install + boot from disk (hands-free, blocking)
-  bcm-start             Boot existing head node from disk (blocking)
-  bcm-stop              Kill running BCM VM
-  bcm-wait              Poll SSH until head node is ready
+| Target | Description |
+|--------|-------------|
+| `make setup` | Verifies all required tools are installed (`jq`, `qemu`, `docker`, `sshpass`, `mtools`, etc.) and checks for `env.json` and the CanvOS submodule. Run this first. |
+| `make download-iso` | Downloads the BCM ISO from JFrog using the token in `env.json`. Saves to `dist/`. Skips if ISO already exists. |
 
-Kairos Build
-  kairos-build          Build Kairos ISO via CanvOS (requires Docker)
-  kairos-extract        Extract PXE artifacts from Kairos ISO
+### BCM Head Node
 
-Kairos Deploy & Test
-  kairos-deploy         Upload PXE artifacts to BCM head node
-  kairos-run            Launch compute node VM (direct kernel boot, blocking)
-  kairos-validate       Validate Kairos node through BCM head node
-  kairos-wait           Poll until compute node is SSH-reachable
+| Target | Description |
+|--------|-------------|
+| `make bcm-prepare` | Extracts kernel and rootfs from the BCM ISO, patches `build-config.xml`, injects the auto-install systemd service, repacks the rootfs, and creates a FAT config drive with the password. Outputs to `build/.bcm-*`. Takes ~1 minute. |
+| `make bcm-run` | Launches the BCM head node VM with fully automated installation. Runs in two phases: Phase 1 boots the patched installer via direct kernel boot and monitors the serial log for completion (14 steps, ~20 min). Phase 2 kills the installer VM and relaunches from the installed disk. Blocking. |
+| `make bcm-start` | Boots the BCM head node from an existing disk image (`build/bcm-disk.qcow2`). Use this after the initial install to restart the head node without reinstalling. Blocking. |
+| `make bcm-stop` | Kills the running BCM head node QEMU process. |
+| `make bcm-wait` | Polls SSH on `localhost:10022` every 10 seconds until the head node is reachable. Shows elapsed time. Run in a separate terminal while `bcm-run` or `bcm-start` is running. |
 
-Composite
-  all                   download-iso + bcm-prepare + kairos-build + kairos-extract
-  test                  kairos-deploy + kairos-run
-  validate              kairos-validate
+### Kairos Build & Extract
 
-Cleanup
-  clean                 Remove build/ directory
-  clean-bcm             Remove BCM auto-install artifacts
-  clean-kairos          Remove PXE artifacts (build/pxe/)
-  clean-disks           Remove all QEMU disk images
-  clean-all             Remove everything including dist/
-  reset                 Full clean + reset CanvOS submodule
-```
+| Target | Description |
+|--------|-------------|
+| `make kairos-build` | Builds the Kairos edge installer ISO using the CanvOS Earthly build system. Generates `.arg` from `src/canvos/.arg.template`, copies any custom overlay files, and runs `earthly.sh +iso`. Requires Docker. Output: `build/palette-edge-installer.iso` (~1.6 GB). Takes 30–60 minutes. |
+| `make kairos-extract` | Mounts the Kairos ISO and extracts PXE boot artifacts (kernel, initrd, squashfs). Generates `user-data.yaml` with Palette registration config, builds a dracut pre-pivot hook overlay, and combines it into `initrd-combined`. Outputs to `build/pxe/`. Takes ~5 minutes. |
+
+### Kairos Deploy & Test
+
+| Target | Description |
+|--------|-------------|
+| `make kairos-deploy` | SCPs PXE artifacts to the BCM head node at `/tftpboot/kairos/` and starts a Python HTTP server on `10.141.255.254:8888` to serve them to compute nodes. Requires BCM head node to be running. |
+| `make kairos-run` | Launches a Kairos compute node VM using direct kernel boot (bypasses iPXE). The VM connects to the BCM internal network via QEMU socket, gets a DHCP address, and fetches the squashfs rootfs over HTTP. Blocking. |
+| `make kairos-wait` | Polls the BCM head node's DHCP leases for a compute node IP, then polls SSH to that node until it's reachable. Shows elapsed time. Run in a separate terminal while `kairos-run` is running. |
+| `make kairos-validate` | SSHes through the BCM head node to the compute node (auto-detected via DHCP leases) and runs health checks: OS release, kairos-agent, kernel params, squashfs mount, k3s, stylus-agent status, and networking. |
+
+### Composite
+
+| Target | Description |
+|--------|-------------|
+| `make all` | Runs the full build pipeline: `download-iso` → `bcm-prepare` → `kairos-build` → `kairos-extract`. Does not launch any VMs. |
+| `make test` | Deploys and boots a Kairos compute node: `kairos-deploy` → `kairos-run`. Requires BCM head node to be running. |
+| `make validate` | Alias for `kairos-validate`. |
+
+### Cleanup
+
+| Target | Description |
+|--------|-------------|
+| `make clean` | Removes the entire `build/` directory (Kairos ISO, PXE artifacts, auto-install artifacts). |
+| `make clean-bcm` | Removes only the BCM auto-install artifacts (`build/.bcm-kernel`, `.bcm-rootfs-auto.cgz`, `.bcm-init.img`). |
+| `make clean-kairos` | Removes the Kairos ISO and PXE artifacts (`build/pxe/`, `build/palette-edge-installer.iso`). |
+| `make clean-disks` | Removes all QEMU disk images (`build/*.qcow2`). |
+| `make clean-all` | Runs `clean` + `clean-bcm` + `clean-disks` and also removes `dist/` (downloaded ISOs). |
+| `make reset` | Runs `clean-all` then resets the CanvOS submodule to upstream (`git checkout . && git clean -fdx`). |
 
 ## Project Structure
 
