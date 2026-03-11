@@ -170,7 +170,7 @@ elapsed=0
 while true; do
     CMD_STATUS=$(${SSH_CMD} "systemctl is-active cmd" 2>/dev/null | filter_motd || echo "inactive")
     # Verify cmsh can actually talk to the daemon (not just that systemd says active)
-    CMSH_OK=$(${SSH_CMD} "cmsh -c 'main; status' >/dev/null 2>&1 && echo ok || echo no" 2>/dev/null | filter_motd || echo "no")
+    CMSH_OK=$(${SSH_CMD} "cmsh -c 'device; list' >/dev/null 2>&1 && echo ok || echo no" 2>/dev/null | filter_motd || echo "no")
     if [[ "$CMD_STATUS" == "active" ]] && [[ "$CMSH_OK" == "ok" ]]; then
         break
     fi
