@@ -211,13 +211,13 @@ run_step() {
     > "$logf"
     set_status "$step" "running"
 
+    local rc=0
     # Special case: if bcm-run has an existing disk, boot from it instead of reinstalling
     if [[ "$step" == "bcm-run" ]] && [[ -f "build/bcm-disk.qcow2" ]]; then
-        make bcm-start > "$logf" 2>&1
+        make bcm-start > "$logf" 2>&1 || rc=$?
     else
-        make "$step" > "$logf" 2>&1
+        make "$step" > "$logf" 2>&1 || rc=$?
     fi
-    local rc=$?
 
     if [[ $rc -eq 0 ]]; then
         set_status "$step" "done"
