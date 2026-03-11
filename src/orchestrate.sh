@@ -575,28 +575,41 @@ sleep 2
 # ════════════════════════════════════════════════
 #  Phase 2: Deploy + Run (sequential)
 # ════════════════════════════════════════════════
+banner "Phase 2: Deploy + Provision"
 
-# kairos-deploy (foreground, blocks until done)
-run_step "kairos-deploy" || true
-if [[ "$(get_status "kairos-deploy")" == "fail" ]]; then
+# kairos-deploy (foreground, streamed live — this step has long waits)
+echo -e "${CYAN}[START]${NC} kairos-deploy (output streamed live)"
+echo -e "${CYAN}────────────────────────────────────────${NC}"
+set_status "kairos-deploy" "running"
+deploy_logf=$(log_file "kairos-deploy")
+local_rc=0
+make kairos-deploy 2>&1 | tee "$deploy_logf" || local_rc=${PIPESTATUS[0]}
+echo -e "${CYAN}────────────────────────────────────────${NC}"
+if [[ $local_rc -eq 0 ]]; then
+    set_status "kairos-deploy" "done"
+    echo -e "${GREEN}[DONE]${NC} kairos-deploy"
+else
+    set_status "kairos-deploy" "fail"
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ kairos-deploy failed ═══${NC}"
     exit 1
 fi
 
-# kairos-run (background with rolling status)
-run_step "kairos-run" &
-PIDS["kairos-run"]=$!
+echo ""
 
-while kill -0 "${PIDS["kairos-run"]}" 2>/dev/null; do
-    show_status "${ALL_STEPS[@]}"
-    echo -e "\n  ${CYAN}(refreshing every 5s)${NC}"
-    sleep 5
-    clear
-    banner "Pipeline Status"
-done
-
-if ! wait "${PIDS["kairos-run"]}"; then
+# kairos-run (foreground, streamed live — also has long waits)
+echo -e "${CYAN}[START]${NC} kairos-run (output streamed live)"
+echo -e "${CYAN}────────────────────────────────────────${NC}"
+set_status "kairos-run" "running"
+run_logf=$(log_file "kairos-run")
+local_rc=0
+make kairos-run 2>&1 | tee "$run_logf" || local_rc=${PIPESTATUS[0]}
+echo -e "${CYAN}────────────────────────────────────────${NC}"
+if [[ $local_rc -eq 0 ]]; then
+    set_status "kairos-run" "done"
+    echo -e "${GREEN}[DONE]${NC} kairos-run"
+else
+    set_status "kairos-run" "fail"
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ kairos-run failed ═══${NC}"
     exit 1
@@ -608,9 +621,20 @@ sleep 2
 # ════════════════════════════════════════════════
 #  Phase 3: Validate
 # ════════════════════════════════════════════════
+banner "Phase 3: Validate"
 
-run_step "validate" || true
-if [[ "$(get_status "validate")" == "fail" ]]; then
+echo -e "${CYAN}[START]${NC} validate (output streamed live)"
+echo -e "${CYAN}────────────────────────────────────────${NC}"
+set_status "validate" "running"
+validate_logf=$(log_file "validate")
+local_rc=0
+make validate 2>&1 | tee "$validate_logf" || local_rc=${PIPESTATUS[0]}
+echo -e "${CYAN}────────────────────────────────────────${NC}"
+if [[ $local_rc -eq 0 ]]; then
+    set_status "validate" "done"
+    echo -e "${GREEN}[DONE]${NC} validate"
+else
+    set_status "validate" "fail"
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ validate failed ═══${NC}"
     exit 1
