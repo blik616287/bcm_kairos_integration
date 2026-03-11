@@ -111,6 +111,24 @@ is_dirty() {
     [[ -n "${DIRTY_STEPS[$1]:-}" ]]
 }
 
+# Cascade: if a step is dirty, all downstream steps must also rebuild.
+# DAG edges:
+#   download-iso → bcm-prepare → bcm-run → kairos-deploy → kairos-run → validate
+#   kairos-build → kairos-extract → kairos-deploy
+cascade_dirty() {
+    local changed=true
+    while [[ "$changed" == "true" ]]; do
+        changed=false
+        is_dirty "download-iso"   && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]]   && DIRTY_STEPS[bcm-prepare]=1   && changed=true
+        is_dirty "bcm-prepare"    && [[ -z "${DIRTY_STEPS[bcm-run]:-}" ]]       && DIRTY_STEPS[bcm-run]=1       && changed=true
+        is_dirty "bcm-run"        && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]] && DIRTY_STEPS[kairos-deploy]=1 && changed=true
+        is_dirty "kairos-build"   && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]]&& DIRTY_STEPS[kairos-extract]=1&& changed=true
+        is_dirty "kairos-extract" && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]] && DIRTY_STEPS[kairos-deploy]=1 && changed=true
+        is_dirty "kairos-deploy"  && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]]    && DIRTY_STEPS[kairos-run]=1    && changed=true
+        is_dirty "kairos-run"     && [[ -z "${DIRTY_STEPS[validate]:-}" ]]      && DIRTY_STEPS[validate]=1      && changed=true
+    done
+}
+
 # ---- Skip detection ----
 # Returns 0 (true) if a step can be skipped.
 # A step is skipped only if artifacts exist AND no uncommitted changes affect it.
@@ -126,18 +144,16 @@ can_skip() {
 
     case "$step" in
         download-iso)
-            # Skip if ISO exists and is roughly the right size
+            # Skip if ISO exists and sha256 matches JFrog
             if [[ -f "dist/${ISO_FILENAME}" ]]; then
-                local actual_size
-                actual_size=$(stat -c%s "dist/${ISO_FILENAME}" 2>/dev/null || echo 0)
-                if [[ "$ISO_TOTAL_MB" -gt 0 ]]; then
-                    # Within 1% of expected size
-                    local expected_bytes=$(( ISO_TOTAL_MB * 1048576 ))
-                    local threshold=$(( expected_bytes / 100 ))
-                    local diff=$(( actual_size - expected_bytes ))
-                    [[ ${diff#-} -lt $threshold ]]
+                if [[ -n "$ISO_REMOTE_SHA256" ]]; then
+                    local local_sha256
+                    local_sha256=$(sha256sum "dist/${ISO_FILENAME}" 2>/dev/null | awk '{print $1}')
+                    [[ "$local_sha256" == "$ISO_REMOTE_SHA256" ]]
                 else
-                    # No expected size known — skip if >100MB (not a truncated download)
+                    # No remote checksum available — skip if file is non-trivial size
+                    local actual_size
+                    actual_size=$(stat -c%s "dist/${ISO_FILENAME}" 2>/dev/null || echo 0)
                     [[ "$actual_size" -gt 104857600 ]]
                 fi
             else
@@ -307,15 +323,20 @@ JFROG_REPO=$(jq -r '.jfrog_repo // "iso-releases"' env.json 2>/dev/null || echo 
 JFROG_TOKEN=$(jq -r '.jfrog_token // empty' env.json 2>/dev/null || true)
 BCM_PASSWORD=$(jq -r '.bcm_password // empty' env.json 2>/dev/null || true)
 
-# Get ISO size via HEAD request for download progress
+# Get ISO metadata from JFrog (size + sha256) for skip detection and download progress
 ISO_TOTAL_MB=0
+ISO_REMOTE_SHA256=""
 if [[ -n "$JFROG_TOKEN" ]]; then
-    ISO_TOTAL_BYTES=$(curl --silent --head --fail --location \
+    # JFrog storage API returns checksums and size
+    ISO_INFO=$(curl --silent --fail \
         -H "Authorization: Bearer ${JFROG_TOKEN}" \
-        "https://${JFROG_INSTANCE}/artifactory/${JFROG_REPO}/${ISO_FILENAME}" 2>/dev/null \
-        | grep -i content-length | tail -1 | tr -d '[:space:]' | cut -d: -f2)
-    if [[ -n "$ISO_TOTAL_BYTES" && "$ISO_TOTAL_BYTES" -gt 0 ]] 2>/dev/null; then
-        ISO_TOTAL_MB=$(( ISO_TOTAL_BYTES / 1048576 ))
+        "https://${JFROG_INSTANCE}/artifactory/api/storage/${JFROG_REPO}/${ISO_FILENAME}" 2>/dev/null || true)
+    if [[ -n "$ISO_INFO" ]]; then
+        ISO_TOTAL_BYTES=$(echo "$ISO_INFO" | jq -r '.size // empty' 2>/dev/null || true)
+        ISO_REMOTE_SHA256=$(echo "$ISO_INFO" | jq -r '.checksums.sha256 // empty' 2>/dev/null || true)
+        if [[ -n "$ISO_TOTAL_BYTES" && "$ISO_TOTAL_BYTES" -gt 0 ]] 2>/dev/null; then
+            ISO_TOTAL_MB=$(( ISO_TOTAL_BYTES / 1048576 ))
+        fi
     fi
 fi
 
@@ -351,6 +372,7 @@ fi
 
 # ---- Detect uncommitted changes ----
 detect_dirty_steps
+cascade_dirty
 
 # ---- Pre-flight skip detection ----
 banner "Checking existing artifacts"
