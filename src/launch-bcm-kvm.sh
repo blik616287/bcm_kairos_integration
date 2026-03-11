@@ -241,7 +241,7 @@ elif [[ "$AUTO_INSTALL" == "true" ]]; then
     # Monitor serial log for install completion, streaming progress
     LAST_STEP=""
     while true; do
-        if grep -q "INSTALLATION COMPLETE" "${SERIAL_LOG}" 2>/dev/null; then
+        if grep -q "INSTALLATION COMPLETE\|GRUB patched" "${SERIAL_LOG}" 2>/dev/null; then
             echo ""
             echo "[OK] Installation complete — stopping installer VM..."
             pkill -f "qemu-system.*${VM_NAME}" 2>/dev/null || true
