@@ -211,7 +211,7 @@ run_step() {
     > "$logf"
     set_status "$step" "running"
 
-    # Special case: if bcm-run can be replaced with bcm-start (disk exists, VM not running)
+    # Special case: if bcm-run has an existing disk, boot from it instead of reinstalling
     if [[ "$step" == "bcm-run" ]] && [[ -f "build/bcm-disk.qcow2" ]]; then
         make bcm-start > "$logf" 2>&1
     else
@@ -321,6 +321,76 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM HUP
 
+# ---- Dependency check ----
+# command → apt package mapping
+declare -A APT_PACKAGES=(
+    [jq]=jq
+    [qemu-system-x86_64]=qemu-system-x86
+    [qemu-img]=qemu-utils
+    [docker]=docker.io
+    [sshpass]=sshpass
+    [curl]=curl
+    [cpio]=cpio
+    [gzip]=gzip
+    [mcopy]=mtools
+    [mkfs.vfat]=dosfstools
+    [sha256sum]=coreutils
+)
+
+banner "Checking dependencies"
+
+MISSING_CMDS=()
+MISSING_PKGS=()
+for cmd in "${!APT_PACKAGES[@]}"; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo -e "  ✅ ${cmd}"
+    else
+        echo -e "  ❌ ${cmd} (${APT_PACKAGES[$cmd]})"
+        MISSING_CMDS+=("$cmd")
+        # Avoid duplicate packages
+        pkg="${APT_PACKAGES[$cmd]}"
+        already=false
+        for p in "${MISSING_PKGS[@]+"${MISSING_PKGS[@]}"}"; do
+            [[ "$p" == "$pkg" ]] && already=true && break
+        done
+        [[ "$already" == "false" ]] && MISSING_PKGS+=("$pkg")
+    fi
+done
+
+# Install missing packages
+if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${YELLOW}Installing missing packages: ${MISSING_PKGS[*]}${NC}"
+    if sudo apt-get update -qq && sudo apt-get install -y -qq "${MISSING_PKGS[@]}"; then
+        echo -e "${GREEN}[OK]${NC} Packages installed"
+    else
+        echo -e "${RED}[FAIL]${NC} Could not install: ${MISSING_PKGS[*]}"
+        echo "Install manually and retry."
+        exit 1
+    fi
+fi
+
+# Check env.json
+if [[ ! -f "env.json" ]]; then
+    echo ""
+    echo -e "${RED}[FAIL]${NC} env.json not found. Run: cp env.json.example env.json"
+    exit 1
+fi
+echo -e "  ✅ env.json"
+
+# Check CanvOS submodule
+if [[ ! -d "CanvOS/.git" ]]; then
+    echo ""
+    echo -e "${YELLOW}Initializing CanvOS submodule...${NC}"
+    git submodule update --init --recursive
+    if [[ ! -d "CanvOS/.git" ]]; then
+        echo -e "${RED}[FAIL]${NC} CanvOS submodule init failed"
+        exit 1
+    fi
+fi
+echo -e "  ✅ CanvOS submodule"
+echo ""
+
 # ---- Read config ----
 ISO_FILENAME=$(jq -r '.iso_filename // "bcm-11.0-ubuntu2404.iso"' env.json 2>/dev/null || echo "bcm-11.0-ubuntu2404.iso")
 JFROG_INSTANCE=$(jq -r '.jfrog_instance // "insightsoftmax.jfrog.io"' env.json 2>/dev/null || echo "insightsoftmax.jfrog.io")
@@ -379,25 +449,41 @@ fi
 detect_dirty_steps
 cascade_dirty
 
-# ---- Pre-flight skip detection ----
-banner "Checking existing artifacts"
+# ---- BCM liveness check ----
+# If bcm-run artifacts exist and it's not dirty, but the VM isn't running,
+# we need to start it. A fresh BCM boot means kairos-deploy onward must re-run.
+BCM_NEEDS_START=false
+if ! is_dirty "bcm-run" && [[ -f "build/bcm-disk.qcow2" ]]; then
+    if ! can_skip "bcm-run"; then
+        BCM_NEEDS_START=true
+        DIRTY_STEPS[kairos-deploy]=1
+        DIRTY_STEPS[kairos-run]=1
+    fi
+fi
 
-# Show dirty files if any
+# ---- Pre-flight status ----
+banner "Pre-flight check"
+
 if [[ ${#DIRTY_STEPS[@]} -gt 0 ]]; then
-    echo -e "${YELLOW}Uncommitted changes detected affecting:${NC}"
+    echo -e "${YELLOW}Steps invalidated:${NC}"
     for s in "${!DIRTY_STEPS[@]}"; do
-        echo -e "  ${YELLOW}→ ${s}${NC} (will rebuild)"
+        echo -e "  ${YELLOW}→ ${s}${NC}"
     done
+    echo ""
+fi
+
+if [[ "$BCM_NEEDS_START" == "true" ]]; then
+    echo -e "${YELLOW}BCM head node not running — will start from disk and re-deploy.${NC}"
     echo ""
 fi
 
 SKIPPABLE=0
 for s in "${ALL_STEPS[@]}"; do
     if can_skip "$s"; then
-        echo -e "  ⏭️  ${CYAN}${s}${NC} — skip (artifacts present, no changes)"
+        echo -e "  ⏭️  ${CYAN}${s}${NC} — skip"
         SKIPPABLE=$((SKIPPABLE + 1))
     elif is_dirty "$s" && [[ "$s" != "download-iso" ]]; then
-        echo -e "  🔄 ${YELLOW}${s}${NC} — rebuild (uncommitted changes)"
+        echo -e "  🔄 ${YELLOW}${s}${NC} — rebuild (invalidated)"
     else
         echo -e "  ⏳ ${s} — needs to run"
     fi
