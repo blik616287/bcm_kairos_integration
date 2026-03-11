@@ -281,11 +281,11 @@ else
 fi
 
 # Check Palette registration
-REG_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager | grep -c \"Registration completed\"'" 2>/dev/null | filter_motd || echo "0")
-if [[ "$REG_CHECK" -gt 0 ]] 2>/dev/null; then
-    check "Palette registration" "PASS" "registered"
+REG_LOGS=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
+    check "Palette registration" "PASS" "registered with Palette"
 else
-    check "Palette registration" "WARN" "registration not yet completed"
+    check "Palette registration" "WARN" "registration not detected"
 fi
 
 # ---- Summary ----

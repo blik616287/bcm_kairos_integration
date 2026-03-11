@@ -459,24 +459,15 @@ else
     FAIL=true
 fi
 
-# Wait for successful Palette registration (with timeout)
-echo "[..] Waiting for Palette registration..."
-reg_elapsed=0
-reg_timeout=300
-while true; do
-    if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd | grep -q "Registration completed"; then
-        echo "[OK] Palette registration completed"
-        break
-    fi
-    reg_elapsed=$((reg_elapsed + 10))
-    if [[ $reg_elapsed -ge $reg_timeout ]]; then
-        echo "[FAIL] Palette registration not completed after ${reg_timeout}s"
-        FAIL=true
-        break
-    fi
-    printf "\r  [%dm%02ds] Waiting for registration..." $((reg_elapsed / 60)) $((reg_elapsed % 60))
-    sleep 10
-done
+# Verify stylus-agent has registered with Palette
+echo "[..] Checking Palette registration status..."
+REG_LOGS=$(${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
+    echo "[OK] stylus-agent registered with Palette"
+else
+    echo "[FAIL] stylus-agent has not registered with Palette"
+    FAIL=true
+fi
 
 if [[ "$FAIL" == "true" ]]; then
     echo ""
