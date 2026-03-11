@@ -398,3 +398,52 @@ while true; do
     printf "\r  [%dm%02ds] Waiting... %s" $((elapsed / 60)) $((elapsed % 60)) "$(echo "$NODE_STATUS" | tr -d '[:space:]' | head -c 40)"
     sleep 10
 done
+
+# ---- Post-provisioning validation ----
+echo "[..] Validating services on compute node..."
+NODE_SSH="${SSH_CMD} \"ssh ${SSH_OPTS} root@10.141.0.1\""
+FAIL=false
+
+# Check cmd service
+if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active cmd'" 2>/dev/null | grep -q "active"; then
+    echo "[OK] cmd service is active"
+else
+    echo "[FAIL] cmd service is not active"
+    FAIL=true
+fi
+
+# Check stylus-agent service
+if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active stylus-agent'" 2>/dev/null | grep -q "active"; then
+    echo "[OK] stylus-agent is active"
+else
+    echo "[FAIL] stylus-agent is not active"
+    FAIL=true
+fi
+
+# Wait for successful Palette registration (with timeout)
+echo "[..] Waiting for Palette registration..."
+reg_elapsed=0
+reg_timeout=300
+while true; do
+    if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | grep -q "Registration completed"; then
+        echo "[OK] Palette registration completed"
+        break
+    fi
+    reg_elapsed=$((reg_elapsed + 10))
+    if [[ $reg_elapsed -ge $reg_timeout ]]; then
+        echo "[FAIL] Palette registration not completed after ${reg_timeout}s"
+        FAIL=true
+        break
+    fi
+    printf "\r  [%dm%02ds] Waiting for registration..." $((reg_elapsed / 60)) $((reg_elapsed % 60))
+    sleep 10
+done
+
+if [[ "$FAIL" == "true" ]]; then
+    echo ""
+    echo "[FAIL] Post-provisioning validation failed"
+    exit 1
+fi
+
+echo ""
+echo "[OK] Compute node fully provisioned and registered (total: $((elapsed + reg_elapsed))s)"
