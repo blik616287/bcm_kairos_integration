@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 LOG_DIR="./logs"
@@ -94,7 +94,27 @@ show_status() {
         [[ "$status" == "fail" ]] && icon="❌"
         [[ "$status" == "pending" ]] && icon="⏸️ "
         [[ "$status" == "blocked" ]] && icon="🔒"
-        echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
+
+        # Special handling: show download progress for download-iso
+        if [[ "$s" == "download-iso" && "$status" == "running" ]]; then
+            local iso_path="dist/${ISO_FILENAME:-bcm-11.0-ubuntu2404.iso}"
+            if [[ -f "$iso_path" ]]; then
+                local cur_bytes
+                cur_bytes=$(stat -c%s "$iso_path" 2>/dev/null || echo 0)
+                local cur_mb=$(( cur_bytes / 1048576 ))
+                if [[ -n "${ISO_TOTAL_MB:-}" && "$ISO_TOTAL_MB" -gt 0 ]]; then
+                    local pct=$(( cur_mb * 100 / ISO_TOTAL_MB ))
+                    echo -e "  ${icon} ${BOLD}${s}${NC} [${status}] — ${cur_mb}MB / ${ISO_TOTAL_MB}MB (${pct}%)"
+                else
+                    echo -e "  ${icon} ${BOLD}${s}${NC} [${status}] — ${cur_mb}MB downloaded"
+                fi
+            else
+                echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
+            fi
+        else
+            echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
+        fi
+
         if [[ -s "$logf" ]]; then
             tail -n 5 "$logf" 2>/dev/null | cut -c1-80 | sed 's/^/     │ /'
         fi
@@ -150,6 +170,24 @@ on_signal() {
 
 trap cleanup EXIT
 trap on_signal INT TERM HUP
+
+# ---- Read config for download progress ----
+ISO_FILENAME=$(jq -r '.iso_filename // "bcm-11.0-ubuntu2404.iso"' env.json 2>/dev/null || echo "bcm-11.0-ubuntu2404.iso")
+JFROG_INSTANCE=$(jq -r '.jfrog_instance // "insightsoftmax.jfrog.io"' env.json 2>/dev/null || echo "insightsoftmax.jfrog.io")
+JFROG_REPO=$(jq -r '.jfrog_repo // "iso-releases"' env.json 2>/dev/null || echo "iso-releases")
+JFROG_TOKEN=$(jq -r '.jfrog_token // empty' env.json 2>/dev/null || true)
+
+# Get ISO size via HEAD request for download progress
+ISO_TOTAL_MB=0
+if [[ -n "$JFROG_TOKEN" ]]; then
+    ISO_TOTAL_BYTES=$(curl --silent --head --fail --location \
+        -H "Authorization: Bearer ${JFROG_TOKEN}" \
+        "https://${JFROG_INSTANCE}/artifactory/${JFROG_REPO}/${ISO_FILENAME}" 2>/dev/null \
+        | grep -i content-length | tail -1 | tr -d '[:space:]' | cut -d: -f2)
+    if [[ -n "$ISO_TOTAL_BYTES" && "$ISO_TOTAL_BYTES" -gt 0 ]] 2>/dev/null; then
+        ISO_TOTAL_MB=$(( ISO_TOTAL_BYTES / 1048576 ))
+    fi
+fi
 
 # ════════════════════════════════════════════════
 #  Phase 0: Clean

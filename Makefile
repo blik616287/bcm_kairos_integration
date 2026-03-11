@@ -113,10 +113,18 @@ download-iso: _require-jfrog ## Download BCM ISO from JFrog to dist/
 		echo "Delete it first to re-download."; \
 	else \
 		echo "Downloading $(ISO_FILENAME) from $(JFROG_INSTANCE)..."; \
-		curl --fail --location --progress-bar \
-			-H "Authorization: Bearer $(JFROG_TOKEN)" \
-			-o "$(ISO_PATH)" \
-			"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
+		if [ -t 1 ]; then \
+			curl --fail --location --progress-bar \
+				-H "Authorization: Bearer $(JFROG_TOKEN)" \
+				-o "$(ISO_PATH)" \
+				"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
+		else \
+			curl --fail --location --silent --show-error \
+				-H "Authorization: Bearer $(JFROG_TOKEN)" \
+				-o "$(ISO_PATH)" \
+				--write-out "Progress: %{size_download} bytes (%{speed_download} B/s)\n" \
+				"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
+		fi; \
 		echo "Downloaded: $(ISO_PATH)"; \
 	fi
 
