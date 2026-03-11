@@ -15,7 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 LOG_DIR="./logs"
-mkdir -p "$LOG_DIR"
+STATUS_DIR="./logs/.status"
+mkdir -p "$LOG_DIR" "$STATUS_DIR"
 
 # Colors
 RED='\033[0;31m'
@@ -25,9 +26,17 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Track background PIDs and their steps
+# Track background PIDs
 declare -A PIDS
-declare -A STEP_STATUS
+
+# File-based status (works across subshells)
+set_status() {
+    echo "$2" > "${STATUS_DIR}/$1"
+}
+
+get_status() {
+    cat "${STATUS_DIR}/$1" 2>/dev/null || echo "pending"
+}
 
 banner() {
     echo ""
@@ -41,44 +50,24 @@ log_file() {
     echo "${LOG_DIR}/orchestrate-${1}.log"
 }
 
-# Run a make target, logging to file. Sets STEP_STATUS on completion.
+# Run a make target, logging to file. Updates status file on completion.
 run_step() {
     local step="$1"
     local logf
     logf=$(log_file "$step")
     > "$logf"
 
-    STEP_STATUS[$step]="running"
+    set_status "$step" "running"
 
     make "$step" > "$logf" 2>&1
     local rc=$?
 
     if [[ $rc -eq 0 ]]; then
-        STEP_STATUS[$step]="done"
+        set_status "$step" "done"
     else
-        STEP_STATUS[$step]="fail"
+        set_status "$step" "fail"
     fi
     return $rc
-}
-
-# Run a step in the background, store PID
-run_step_bg() {
-    local step="$1"
-    run_step "$step" &
-    PIDS[$step]=$!
-}
-
-# Wait for a background step to finish, exit on failure
-wait_step() {
-    local step="$1"
-    local pid="${PIDS[$step]}"
-    if ! wait "$pid"; then
-        echo ""
-        echo -e "${RED}═══ Pipeline failed at: ${step} ═══${NC}"
-        echo -e "${RED}Log: $(log_file "$step")${NC}"
-        kill_bg
-        exit 1
-    fi
 }
 
 # Show compact rolling status for active logs (last 5 lines each)
@@ -88,7 +77,8 @@ show_status() {
     for s in "${steps[@]}"; do
         local logf
         logf=$(log_file "$s")
-        local status="${STEP_STATUS[$s]:-pending}"
+        local status
+        status=$(get_status "$s")
         local icon="⏳"
         [[ "$status" == "done" ]] && icon="✅"
         [[ "$status" == "fail" ]] && icon="❌"
@@ -115,7 +105,7 @@ show_status() {
             echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
         fi
 
-        if [[ -s "$logf" ]]; then
+        if [[ "$status" == "running" ]] && [[ -s "$logf" ]]; then
             tail -n 5 "$logf" 2>/dev/null | cut -c1-80 | sed 's/^/     │ /'
         fi
     done
@@ -135,7 +125,6 @@ cleanup() {
     # Kill all tracked background PIDs and their process trees
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            # Kill the entire process group spawned by the subshell
             pkill -P "$pid" 2>/dev/null || true
             kill "$pid" 2>/dev/null || true
         fi
@@ -157,6 +146,9 @@ cleanup() {
     # Kill any remaining children of this script
     jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
     wait 2>/dev/null || true
+
+    # Clean up status files
+    rm -rf "$STATUS_DIR"
 
     if [[ $exit_code -ne 0 ]] || [[ "${ORCHESTRATE_INTERRUPTED:-}" == "true" ]]; then
         echo -e "${RED}═══ Cleanup complete ═══${NC}"
@@ -189,6 +181,17 @@ if [[ -n "$JFROG_TOKEN" ]]; then
     fi
 fi
 
+# All pipeline steps
+ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-extract" "kairos-deploy" "kairos-run" "validate")
+
+# Initialize all statuses
+for s in "${ALL_STEPS[@]}"; do
+    set_status "$s" "pending"
+done
+set_status "kairos-deploy" "blocked"
+set_status "kairos-run" "blocked"
+set_status "validate" "blocked"
+
 # ════════════════════════════════════════════════
 #  Phase 0: Clean
 # ════════════════════════════════════════════════
@@ -210,9 +213,6 @@ echo ""
     run_step "bcm-run"
 ) &
 PIDS["track-a"]=$!
-STEP_STATUS["download-iso"]="running"
-STEP_STATUS["bcm-prepare"]="pending"
-STEP_STATUS["bcm-run"]="pending"
 
 # Track B (Kairos) — sequential steps in a subshell
 (
@@ -220,19 +220,8 @@ STEP_STATUS["bcm-run"]="pending"
     run_step "kairos-extract"
 ) &
 PIDS["track-b"]=$!
-STEP_STATUS["kairos-build"]="running"
-STEP_STATUS["kairos-extract"]="pending"
-
-# Downstream steps — blocked until Phase 1 completes
-ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-extract" "kairos-deploy" "kairos-run" "validate")
-STEP_STATUS["kairos-deploy"]="blocked"
-STEP_STATUS["kairos-run"]="blocked"
-STEP_STATUS["validate"]="blocked"
 
 # Poll status while both tracks run
-TRACK_A_OK=true
-TRACK_B_OK=true
-
 while true; do
     if ! kill -0 "${PIDS["track-a"]}" 2>/dev/null && ! kill -0 "${PIDS["track-b"]}" 2>/dev/null; then
         break
@@ -243,6 +232,9 @@ while true; do
     clear
     banner "Pipeline Status"
 done
+
+TRACK_A_OK=true
+TRACK_B_OK=true
 
 if ! wait "${PIDS["track-a"]}"; then
     TRACK_A_OK=false
@@ -272,9 +264,8 @@ sleep 2
 # ════════════════════════════════════════════════
 
 # kairos-deploy (foreground, blocks until done)
-STEP_STATUS["kairos-deploy"]="running"
 run_step "kairos-deploy"
-if [[ "${STEP_STATUS["kairos-deploy"]}" == "fail" ]]; then
+if [[ "$(get_status "kairos-deploy")" == "fail" ]]; then
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ kairos-deploy failed ═══${NC}"
     exit 1
@@ -283,7 +274,6 @@ fi
 # kairos-run (background with rolling status)
 run_step "kairos-run" &
 PIDS["kairos-run"]=$!
-STEP_STATUS["kairos-run"]="running"
 
 while kill -0 "${PIDS["kairos-run"]}" 2>/dev/null; do
     show_status "${ALL_STEPS[@]}"
@@ -306,9 +296,8 @@ sleep 2
 #  Phase 3: Validate
 # ════════════════════════════════════════════════
 
-STEP_STATUS["validate"]="running"
 run_step "validate"
-if [[ "${STEP_STATUS["validate"]}" == "fail" ]]; then
+if [[ "$(get_status "validate")" == "fail" ]]; then
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ validate failed ═══${NC}"
     exit 1
