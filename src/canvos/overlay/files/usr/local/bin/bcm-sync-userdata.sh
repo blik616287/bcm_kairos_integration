@@ -39,6 +39,16 @@ if ! grep -q "stylus.registration" /proc/cmdline 2>/dev/null; then
     fi
 fi
 
+# ---- Ensure /run/stylus/userdata exists ----
+# stylus-agent reads config from /run/stylus/userdata on startup.
+# In normal Kairos boot, boot stages create this file. BCM provisioning
+# skips those stages, so we must seed it from /oem/99_userdata.yaml.
+if [ ! -f /run/stylus/userdata ] && [ -f "$USERDATA" ]; then
+    mkdir -p /run/stylus
+    cp "$USERDATA" /run/stylus/userdata
+    echo "bcm-sync: seeded /run/stylus/userdata from $USERDATA"
+fi
+
 # ---- Hostname sync ----
 NODE_NAME=$(hostname)
 

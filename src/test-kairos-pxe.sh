@@ -8,9 +8,11 @@
 #   2. cm-create-image registers it + installs BCM node packages
 #   3. Configure node001 in cmsh (MAC, installmode=FULL, softwareimage=kairos-image)
 #   4. Launch compute VM → BCM PXE boots it → node-installer rsyncs image to disk
-#   5. Node reboots from disk → Kairos starts → stylus-agent registers with Palette
+#   5. BCM installs GRUB and reboots the node
+#   6. Node boots from disk into Kairos → stylus-agent registers with Palette
 #
-# No live boot, no direct kernel boot, no dracut hooks. BCM is the provisioner.
+# This script only prepares the image and launches the VM. BCM handles
+# disk provisioning, GRUB, and reboot. No live boot or dracut hooks.
 #
 # Prerequisites:
 #   - BCM head node running (launch-bcm-kvm.sh --disk or --auto)
@@ -40,6 +42,15 @@ COMPUTE_CPUS="2"
 COMPUTE_DISK_SIZE="80G"
 COMPUTE_DISK="${PROJECT_DIR}/build/compute-node-disk.qcow2"
 COMPUTE_MAC="52:54:00:00:02:01"
+
+# Display: use gtk if DISPLAY or WAYLAND_DISPLAY is set, otherwise headless
+if [[ -z "${QEMU_DISPLAY:-}" ]]; then
+    if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        QEMU_DISPLAY="gtk"
+    else
+        QEMU_DISPLAY="none"
+    fi
+fi
 
 # Mode
 NO_LAUNCH=false
@@ -316,7 +327,7 @@ echo " Serial:    ${SERIAL_LOG}"
 echo "============================================"
 echo ""
 echo "Boot order: disk first, then network (PXE)."
-echo "First boot: empty disk → PXE → BCM provisions → GRUB installed → reboot → Kairos"
+echo "First boot: empty disk → PXE → BCM rsyncs image + installs GRUB → reboot → Kairos + Palette registration"
 echo ""
 echo "Tip: tail -f ${SERIAL_LOG}"
 echo ""
@@ -324,8 +335,8 @@ echo ""
 > "${SERIAL_LOG}"
 
 # Boot order: disk first, network fallback
-# First boot: disk is empty → falls through to PXE → BCM provisions → installs GRUB
-# After provisioning + reboot: boots from disk → Kairos
+# First boot: disk is empty → falls through to PXE → BCM rsyncs image + installs GRUB
+# After reboot: boots from disk → Kairos + stylus-agent registers with Palette
 exec qemu-system-x86_64 \
     ${KVM_FLAG} \
     -m "${COMPUTE_RAM}" \
@@ -337,6 +348,6 @@ exec qemu-system-x86_64 \
     -netdev socket,id=intnet,connect=:31337 \
     -device virtio-net-pci,netdev=intnet,mac=${COMPUTE_MAC} \
     -vga virtio \
-    -display gtk \
+    -display "${QEMU_DISPLAY:-none}" \
     -serial file:"${SERIAL_LOG}" \
     -boot order=cn
