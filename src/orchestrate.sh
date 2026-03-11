@@ -379,11 +379,11 @@ fi
 echo -e "  ✅ env.json"
 
 # Check CanvOS submodule
-if [[ ! -d "CanvOS/.git" ]]; then
+if [[ ! -e "CanvOS/.git" ]]; then
     echo ""
     echo -e "${YELLOW}Initializing CanvOS submodule...${NC}"
     git submodule update --init --recursive
-    if [[ ! -d "CanvOS/.git" ]]; then
+    if [[ ! -e "CanvOS/.git" ]]; then
         echo -e "${RED}[FAIL]${NC} CanvOS submodule init failed"
         exit 1
     fi
