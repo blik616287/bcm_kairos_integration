@@ -7,7 +7,7 @@
 #               └── kairos-build → kairos-extract ──────────┘
 #
 # Each step logs to ./logs/orchestrate-<step>.log
-# The script tails the currently active log(s) in real time.
+# Shows a compact rolling status (last 5 lines per step, refreshing every 5s).
 
 set -euo pipefail
 
@@ -48,7 +48,6 @@ run_step() {
     logf=$(log_file "$step")
     > "$logf"
 
-    echo -e "${CYAN}[START]${NC} ${step} → ${logf}"
     STEP_STATUS[$step]="running"
 
     make "$step" > "$logf" 2>&1
@@ -56,12 +55,8 @@ run_step() {
 
     if [[ $rc -eq 0 ]]; then
         STEP_STATUS[$step]="done"
-        echo -e "${GREEN}[PASS]${NC}  ${step} ($(tail -1 "$logf"))"
     else
         STEP_STATUS[$step]="fail"
-        echo -e "${RED}[FAIL]${NC}  ${step} — see ${logf}"
-        echo -e "${RED}        Last 5 lines:${NC}"
-        tail -5 "$logf" | sed 's/^/        /'
     fi
     return $rc
 }
@@ -86,42 +81,75 @@ wait_step() {
     fi
 }
 
-# Tail active logs until all listed steps are done
-tail_active() {
+# Show compact rolling status for active logs (last 5 lines each)
+show_status() {
     local steps=("$@")
-    local logfiles=()
+    echo ""
     for s in "${steps[@]}"; do
-        logfiles+=("$(log_file "$s")")
+        local logf
+        logf=$(log_file "$s")
+        local status="${STEP_STATUS[$s]:-pending}"
+        local icon="⏳"
+        [[ "$status" == "done" ]] && icon="✅"
+        [[ "$status" == "fail" ]] && icon="❌"
+        [[ "$status" == "pending" ]] && icon="⏸️ "
+        [[ "$status" == "blocked" ]] && icon="🔒"
+        echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
+        if [[ -s "$logf" ]]; then
+            tail -n 5 "$logf" 2>/dev/null | cut -c1-80 | sed 's/^/     │ /'
+        fi
     done
-
-    # Start tail in background
-    tail -f "${logfiles[@]}" 2>/dev/null &
-    local tail_pid=$!
-
-    # Wait for all listed steps
-    local all_done=false
-    while [[ "$all_done" == "false" ]]; do
-        all_done=true
-        for s in "${steps[@]}"; do
-            if [[ "${STEP_STATUS[$s]:-pending}" == "running" ]]; then
-                all_done=false
-                break
-            fi
-        done
-        sleep 1
-    done
-
-    kill "$tail_pid" 2>/dev/null || true
-    wait "$tail_pid" 2>/dev/null || true
 }
 
-# Kill all background jobs on exit
-kill_bg() {
+# Cleanup on exit: kill all child processes and QEMU VMs
+cleanup() {
+    local exit_code=$?
+    # Avoid recursive traps
+    trap - EXIT INT TERM HUP
+
+    if [[ $exit_code -ne 0 ]] || [[ "${ORCHESTRATE_INTERRUPTED:-}" == "true" ]]; then
+        echo ""
+        echo -e "${RED}═══ Orchestrate interrupted — cleaning up ═══${NC}"
+    fi
+
+    # Kill all tracked background PIDs and their process trees
     for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+        if kill -0 "$pid" 2>/dev/null; then
+            # Kill the entire process group spawned by the subshell
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+        fi
     done
+
+    # Stop any QEMU VMs started during this run
+    for pidfile in build/.bcm-qemu.pid build/.kairos-qemu.pid; do
+        if [[ -f "$pidfile" ]]; then
+            local qpid
+            qpid=$(cat "$pidfile" 2>/dev/null)
+            if [[ -n "$qpid" ]] && kill -0 "$qpid" 2>/dev/null; then
+                echo -e "  ${YELLOW}Stopping VM ($pidfile)${NC}"
+                kill "$qpid" 2>/dev/null || true
+                rm -f "$pidfile"
+            fi
+        fi
+    done
+
+    # Kill any remaining children of this script
+    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
+    wait 2>/dev/null || true
+
+    if [[ $exit_code -ne 0 ]] || [[ "${ORCHESTRATE_INTERRUPTED:-}" == "true" ]]; then
+        echo -e "${RED}═══ Cleanup complete ═══${NC}"
+    fi
 }
-trap kill_bg EXIT
+
+on_signal() {
+    ORCHESTRATE_INTERRUPTED="true"
+    exit 1
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM HUP
 
 # ════════════════════════════════════════════════
 #  Phase 0: Clean
@@ -157,20 +185,26 @@ PIDS["track-b"]=$!
 STEP_STATUS["kairos-build"]="running"
 STEP_STATUS["kairos-extract"]="pending"
 
-# Tail all active logs while both tracks run
-echo -e "${CYAN}─── Live logs (both tracks) ───${NC}"
-tail -f \
-    "$(log_file download-iso)" \
-    "$(log_file bcm-prepare)" \
-    "$(log_file bcm-run)" \
-    "$(log_file kairos-build)" \
-    "$(log_file kairos-extract)" \
-    2>/dev/null &
-TAIL_PID=$!
+# Downstream steps — blocked until Phase 1 completes
+ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-extract" "kairos-deploy" "kairos-run" "validate")
+STEP_STATUS["kairos-deploy"]="blocked"
+STEP_STATUS["kairos-run"]="blocked"
+STEP_STATUS["validate"]="blocked"
 
-# Wait for both tracks
+# Poll status while both tracks run
 TRACK_A_OK=true
 TRACK_B_OK=true
+
+while true; do
+    if ! kill -0 "${PIDS["track-a"]}" 2>/dev/null && ! kill -0 "${PIDS["track-b"]}" 2>/dev/null; then
+        break
+    fi
+    show_status "${ALL_STEPS[@]}"
+    echo -e "\n  ${CYAN}(refreshing every 5s)${NC}"
+    sleep 5
+    clear
+    banner "Pipeline Status"
+done
 
 if ! wait "${PIDS["track-a"]}"; then
     TRACK_A_OK=false
@@ -179,8 +213,8 @@ if ! wait "${PIDS["track-b"]}"; then
     TRACK_B_OK=false
 fi
 
-kill "$TAIL_PID" 2>/dev/null || true
-wait "$TAIL_PID" 2>/dev/null || true
+# Final Phase 1 status
+show_status "${ALL_STEPS[@]}"
 echo ""
 
 if [[ "$TRACK_A_OK" != "true" ]]; then
@@ -193,44 +227,61 @@ if [[ "$TRACK_B_OK" != "true" ]]; then
 fi
 
 echo -e "${GREEN}═══ Phase 1 complete: BCM running + Kairos built ═══${NC}"
+sleep 2
 
 # ════════════════════════════════════════════════
 #  Phase 2: Deploy + Run (sequential)
 # ════════════════════════════════════════════════
-banner "Phase 2: Deploy + Provision"
 
-run_step "kairos-deploy" || exit 1
-
-echo ""
-echo -e "${CYAN}─── Live log: kairos-run ───${NC}"
-
-run_step "kairos-run" &
-PIDS["kairos-run"]=$!
-
-tail -f "$(log_file kairos-run)" 2>/dev/null &
-TAIL_PID=$!
-
-if ! wait "${PIDS["kairos-run"]}"; then
-    kill "$TAIL_PID" 2>/dev/null || true
-    echo -e "${RED}═══ kairos-run failed ═══${NC}"
+# kairos-deploy (foreground, blocks until done)
+STEP_STATUS["kairos-deploy"]="running"
+run_step "kairos-deploy"
+if [[ "${STEP_STATUS["kairos-deploy"]}" == "fail" ]]; then
+    show_status "${ALL_STEPS[@]}"
+    echo -e "\n${RED}═══ kairos-deploy failed ═══${NC}"
     exit 1
 fi
 
-kill "$TAIL_PID" 2>/dev/null || true
-wait "$TAIL_PID" 2>/dev/null || true
+# kairos-run (background with rolling status)
+run_step "kairos-run" &
+PIDS["kairos-run"]=$!
+STEP_STATUS["kairos-run"]="running"
+
+while kill -0 "${PIDS["kairos-run"]}" 2>/dev/null; do
+    show_status "${ALL_STEPS[@]}"
+    echo -e "\n  ${CYAN}(refreshing every 5s)${NC}"
+    sleep 5
+    clear
+    banner "Pipeline Status"
+done
+
+if ! wait "${PIDS["kairos-run"]}"; then
+    show_status "${ALL_STEPS[@]}"
+    echo -e "\n${RED}═══ kairos-run failed ═══${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}═══ Phase 2 complete: Compute node provisioned ═══${NC}"
+sleep 2
 
 # ════════════════════════════════════════════════
 #  Phase 3: Validate
 # ════════════════════════════════════════════════
-banner "Phase 3: Validate"
-run_step "validate" || exit 1
+
+STEP_STATUS["validate"]="running"
+run_step "validate"
+if [[ "${STEP_STATUS["validate"]}" == "fail" ]]; then
+    show_status "${ALL_STEPS[@]}"
+    echo -e "\n${RED}═══ validate failed ═══${NC}"
+    exit 1
+fi
 
 # ════════════════════════════════════════════════
 #  Summary
 # ════════════════════════════════════════════════
 banner "Pipeline Complete"
+show_status "${ALL_STEPS[@]}"
+echo ""
 echo -e "${GREEN} All steps passed.${NC}"
 echo ""
 echo " Logs:"

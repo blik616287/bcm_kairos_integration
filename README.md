@@ -47,6 +47,23 @@ make clean-all                   # Remove all build artifacts + downloaded ISOs
 
 On subsequent runs, use `make bcm-start` to boot the head node from its existing disk without reinstalling.
 
+### 3. One-Command Orchestration
+
+```bash
+make orchestrate
+```
+
+Runs the entire pipeline as a parallel DAG — both build tracks execute simultaneously, then deploy, provision, and validate run in sequence. A compact rolling status display shows the last 5 lines of each step's log, refreshing every 5 seconds.
+
+```
+DAG:
+  clean-all ──┬── download-iso → bcm-prepare → bcm-run ──┐
+              │                                           ├── kairos-deploy → kairos-run → validate
+              └── kairos-build → kairos-extract ──────────┘
+```
+
+All output is logged to `./logs/orchestrate-<step>.log`. On Ctrl+C, the script traps the signal and cleans up all child processes and QEMU VMs.
+
 ## Prerequisites
 
 | Tool | Package | Purpose |
@@ -128,6 +145,7 @@ Targets are listed in the order they would typically be run during a full end-to
 | `make all` | Runs the full build pipeline: `download-iso` → `bcm-prepare` → `kairos-build` → `kairos-extract`. Does not launch any VMs. |
 | `make test` | Deploys and boots a Kairos compute node: `kairos-deploy` → `kairos-run`. Requires BCM head node to be running. |
 | `make validate` | Alias for `kairos-validate`. |
+| `make orchestrate` | Runs the entire pipeline as a parallel DAG: clean → build (two parallel tracks) → deploy → provision → validate. Shows rolling status display. Traps Ctrl+C to clean up all child processes and VMs. |
 
 ### Cleanup
 
@@ -153,6 +171,7 @@ Targets are listed in the order they would typically be run during a full end-to
 │   ├── extract-kairos-pxe.sh        # Extract PXE artifacts + generate user-data
 │   ├── test-kairos-pxe.sh           # Upload artifacts + launch compute node VM
 │   ├── validate-kairos.sh           # Validate Kairos node health
+│   ├── orchestrate.sh               # Full pipeline as parallel DAG
 │   └── canvos/
 │       ├── .arg.template            # CanvOS build args template
 │       └── overlay/                 # Custom files copied into CanvOS overlay at build time

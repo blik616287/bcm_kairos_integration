@@ -225,6 +225,10 @@ test: kairos-deploy kairos-run ## Deploy and boot Kairos compute node
 .PHONY: validate
 validate: kairos-validate ## Run validation checks on Kairos node
 
+.PHONY: orchestrate
+orchestrate: ## Run full pipeline as parallel DAG (clean → build → deploy → validate)
+	src/orchestrate.sh
+
 # ---- Cleanup ----
 
 .PHONY: clean
