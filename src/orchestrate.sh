@@ -407,9 +407,9 @@ if [[ -n "$JFROG_TOKEN" ]]; then
         -H "Authorization: Bearer ${JFROG_TOKEN}" \
         "https://${JFROG_INSTANCE}/artifactory/api/storage/${JFROG_REPO}/${ISO_FILENAME}" 2>/dev/null || true)
     if [[ -n "$ISO_INFO" ]]; then
-        ISO_TOTAL_BYTES=$(echo "$ISO_INFO" | jq -r '.size // empty' 2>/dev/null || true)
-        ISO_REMOTE_SHA256=$(echo "$ISO_INFO" | jq -r '.checksums.sha256 // empty' 2>/dev/null || true)
-        if [[ -n "$ISO_TOTAL_BYTES" && "$ISO_TOTAL_BYTES" -gt 0 ]] 2>/dev/null; then
+        ISO_TOTAL_BYTES=$(echo "$ISO_INFO" | jq -r '.size // "0"' 2>/dev/null || echo "0")
+        ISO_REMOTE_SHA256=$(echo "$ISO_INFO" | jq -r '.checksums.sha256 // ""' 2>/dev/null || echo "")
+        if [[ "$ISO_TOTAL_BYTES" =~ ^[0-9]+$ ]] && [[ "$ISO_TOTAL_BYTES" -gt 0 ]]; then
             ISO_TOTAL_MB=$(( ISO_TOTAL_BYTES / 1048576 ))
         fi
     fi
