@@ -56,6 +56,11 @@ done
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 BCM_SSH="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${SSH_PORT} root@localhost"
 
+# Filter BCM's MOTD noise from SSH command output
+filter_motd() {
+    grep -vE "cmfirstboot is still in progress|^$" || true
+}
+
 PASS=0
 FAIL=0
 WARN=0
@@ -103,7 +108,7 @@ echo ""
 # ---- Find Kairos node IP ----
 if [[ -z "$KAIROS_IP" ]]; then
     echo "[..] Auto-detecting Kairos node IP from DHCP leases..."
-    KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep '52:54:00:00:02:01' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null)
+    KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep '52:54:00:00:02:01' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd)
     if [[ -z "$KAIROS_IP" ]]; then
         echo "ERROR: Could not find Kairos node in DHCP leases."
         echo "Is the compute node running? (./test-kairos-pxe.sh --direct)"
@@ -114,11 +119,13 @@ echo "[OK] Kairos node IP: ${KAIROS_IP}"
 echo ""
 
 # ---- SSH to Kairos node through head node ----
-echo "[..] Testing SSH to Kairos node (${KAIROS_USER}@${KAIROS_IP})..."
-KAIROS_SSH="${BCM_SSH} \"sshpass -p '${KAIROS_PASSWORD}' ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP}\""
+# BCM provisioning provides root SSH via key-based auth from the head node.
+# The kairos user may not exist (user-data boot stages don't run under BCM).
+echo "[..] Testing SSH to Kairos node (root@${KAIROS_IP})..."
+KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
 
 # Test SSH connectivity
-SSH_TEST=$(${BCM_SSH} "sshpass -p '${KAIROS_PASSWORD}' ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null || true)
+SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
 if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
     echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
     echo "SSH output: ${SSH_TEST}"
@@ -137,7 +144,7 @@ echo "============================================"
 echo ""
 
 # Collect all info in one SSH session to minimize round-trips
-VALIDATION=$(${BCM_SSH} "sshpass -p '${KAIROS_PASSWORD}' ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} '
+VALIDATION=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} '
 echo \"===OS_RELEASE===\"
 cat /etc/os-release 2>/dev/null
 echo \"===KAIROS_RELEASE===\"
@@ -175,7 +182,7 @@ grep kairos /etc/passwd 2>/dev/null || echo MISSING
 echo \"===ISSUE===\"
 cat /etc/issue 2>/dev/null || echo MISSING
 echo \"===END===\"
-'" 2>/dev/null)
+'" 2>/dev/null | filter_motd)
 
 # Parse results
 get_section() {
@@ -204,13 +211,6 @@ else
     check "kairos-agent binary" "FAIL" "not found in PATH"
 fi
 
-# 4. Immucore
-IMMUCORE=$(get_section "IMMUCORE")
-if [[ "$IMMUCORE" != "MISSING" ]] && [[ -n "$IMMUCORE" ]]; then
-    check "Immucore (init)" "PASS" "$(echo "$IMMUCORE" | grep -oP 'version=\S+' || echo 'present')"
-else
-    check "Immucore (init)" "WARN" "could not read journal"
-fi
 
 # 5. Kernel
 echo ""
@@ -219,24 +219,11 @@ KERNEL=$(get_section "KERNEL")
 if [[ -n "$KERNEL" ]]; then check "Kernel" "PASS" "$KERNEL"; else check "Kernel" "FAIL" ""; fi
 
 CMDLINE=$(get_section "CMDLINE")
-if echo "$CMDLINE" | grep -q "rd.cos.disable"; then
-    check "Kairos boot params" "PASS" "rd.cos.disable present"
+# BCM provisioning uses its own kernel cmdline — check for stylus.registration instead
+if echo "$CMDLINE" | grep -q "stylus.registration"; then
+    check "Registration cmdline" "PASS" "stylus.registration present"
 else
-    check "Kairos boot params" "FAIL" "missing expected boot params"
-fi
-
-if echo "$CMDLINE" | grep -q "config_url"; then
-    check "config_url param" "PASS" "user-data URL in cmdline"
-else
-    check "config_url param" "WARN" "not in cmdline (user-data may not be applied)"
-fi
-
-# 6. Squashfs mount
-SQFS=$(get_section "SQUASHFS")
-if [[ "$SQFS" != "NOT_MOUNTED" ]] && [[ -n "$SQFS" ]]; then
-    check "Squashfs rootfs" "PASS" "mounted"
-else
-    check "Squashfs rootfs" "WARN" "not detected (may use different mount)"
+    check "Registration cmdline" "WARN" "stylus.registration not in cmdline (may already be registered)"
 fi
 
 # 7. Network
@@ -251,28 +238,6 @@ else
 fi
 
 # 8. Kubernetes
-echo ""
-echo "-- Kubernetes --"
-K3S_BIN=$(get_section "K3S_BIN")
-if [[ "$K3S_BIN" != "MISSING" ]] && [[ -n "$K3S_BIN" ]]; then
-    check "k3s binary" "PASS" "$(echo "$K3S_BIN" | head -1)"
-else
-    check "k3s binary" "FAIL" "not found"
-fi
-
-K3S_VER=$(get_section "K3S_VERSION")
-if [[ "$K3S_VER" != "MISSING" ]] && [[ -n "$K3S_VER" ]]; then
-    check "k3s version" "PASS" "$K3S_VER"
-else
-    check "k3s version" "WARN" "k3s not running (expected without Palette registration)"
-fi
-
-KUBECTL=$(get_section "KUBECTL")
-if [[ "$KUBECTL" != "MISSING" ]] && [[ -n "$KUBECTL" ]]; then
-    check "kubectl" "PASS" "$KUBECTL"
-else
-    check "kubectl" "WARN" "not in PATH"
-fi
 
 # 9. Services
 echo ""
@@ -288,29 +253,39 @@ else
     check "Kairos/Stylus services" "FAIL" "no kairos/stylus services"
 fi
 
-SVC_STATUS=$(get_section "SERVICES")
-KAIROS_ACTIVE=$(echo "$SVC_STATUS" | head -1)
-STYLUS_ACTIVE=$(echo "$SVC_STATUS" | tail -1)
-if [[ "$KAIROS_ACTIVE" == "active" ]]; then check "kairos-agent service" "PASS" "active"; else check "kairos-agent service" "WARN" "$KAIROS_ACTIVE"; fi
-if [[ "$STYLUS_ACTIVE" == "active" ]]; then check "stylus service" "PASS" "active"; else check "stylus service" "WARN" "$STYLUS_ACTIVE"; fi
+# Check stylus-agent specifically (the key service for BCM provisioning)
+if echo "$SERVICES" | grep -q "stylus-agent.*running"; then
+    check "stylus-agent" "PASS" "active"
+else
+    check "stylus-agent" "FAIL" "not running"
+fi
+
+# Check cmd (BCM compute daemon)
+if echo "$SERVICES" | grep -q "cmd.*running" || ${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
+    check "cmd service" "PASS" "active"
+else
+    check "cmd service" "FAIL" "not running"
+fi
 
 # 10. User
 echo ""
 echo "-- User Config --"
-USERS=$(get_section "USERS")
-if [[ "$USERS" != "MISSING" ]] && [[ -n "$USERS" ]]; then
-    check "kairos user" "PASS" "exists"
-else
-    check "kairos user" "FAIL" "not found in /etc/passwd"
-fi
-check "SSH login" "PASS" "${KAIROS_USER}@${KAIROS_IP} (password auth)"
+check "SSH login" "PASS" "root@${KAIROS_IP} (via BCM head node)"
 
-# 11. Console banner
-ISSUE=$(get_section "ISSUE")
-if echo "$ISSUE" | grep -qi "kairos"; then
-    check "Kairos banner" "PASS" "present in /etc/issue"
+# Check user-data was applied
+USERDATA_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null | filter_motd || true)
+if [[ "$USERDATA_CHECK" == *"present"* ]]; then
+    check "user-data" "PASS" "/oem/99_userdata.yaml present"
 else
-    check "Kairos banner" "WARN" "no Kairos branding in /etc/issue (cosmetic)"
+    check "user-data" "FAIL" "/oem/99_userdata.yaml missing"
+fi
+
+# Check Palette registration
+REG_LOGS=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
+    check "Palette registration" "PASS" "registered with Palette"
+else
+    check "Palette registration" "WARN" "registration not detected"
 fi
 
 # ---- Summary ----

@@ -1,0 +1,12 @@
+[Unit]
+Description=BCM provisioning compatibility fixes
+Before=networking.service cmd.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bcm-compat-fixes.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

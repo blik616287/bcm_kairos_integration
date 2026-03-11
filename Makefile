@@ -37,8 +37,9 @@ ISO_FILENAME      := $(or $(call jq,.iso_filename),bcm-11.0-ubuntu2404.iso)
 ISO_PATH          := dist/$(ISO_FILENAME)
 
 # Export common env vars for scripts
+PALETTE_PROJECT_UID := $(PALETTE_PROJECT)
 export BCM_PASSWORD BCM_HOSTNAME BCM_TIMEZONE
-export PALETTE_ENDPOINT PALETTE_TOKEN PALETTE_PROJECT_UID=$(PALETTE_PROJECT)
+export PALETTE_ENDPOINT PALETTE_TOKEN PALETTE_PROJECT_UID
 export ISO_PATH
 
 # SSH options (reused across targets)
@@ -112,10 +113,18 @@ download-iso: _require-jfrog ## Download BCM ISO from JFrog to dist/
 		echo "Delete it first to re-download."; \
 	else \
 		echo "Downloading $(ISO_FILENAME) from $(JFROG_INSTANCE)..."; \
-		curl --fail --progress-bar \
-			-H "Authorization: Bearer $(JFROG_TOKEN)" \
-			-o "$(ISO_PATH)" \
-			"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
+		if [ -t 1 ]; then \
+			curl --fail --location --progress-bar \
+				-H "Authorization: Bearer $(JFROG_TOKEN)" \
+				-o "$(ISO_PATH)" \
+				"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
+		else \
+			curl --fail --location --silent --show-error \
+				-H "Authorization: Bearer $(JFROG_TOKEN)" \
+				-o "$(ISO_PATH)" \
+				--write-out "Progress: %{size_download} bytes (%{speed_download} B/s)\n" \
+				"https://$(JFROG_INSTANCE)/artifactory/$(JFROG_REPO)/$(ISO_FILENAME)"; \
+		fi; \
 		echo "Downloaded: $(ISO_PATH)"; \
 	fi
 
@@ -126,16 +135,22 @@ bcm-prepare: _require-bcm-password _require-iso ## Prepare BCM auto-install arti
 	src/prepare-bcm-autoinstall.sh --iso "$(ISO_PATH)"
 
 .PHONY: bcm-run
-bcm-run: _require-bcm-password _require-iso ## Launch BCM head node VM (auto-install, blocking)
+bcm-run: _require-bcm-password _require-iso ## Auto-install BCM, boot from disk, return when SSH ready
 	src/launch-bcm-kvm.sh --auto
 
 .PHONY: bcm-start
-bcm-start: _require-bcm-password ## Start existing BCM head node from disk (blocking)
+bcm-start: _require-bcm-password ## Boot existing BCM head node, return when SSH ready
 	src/launch-bcm-kvm.sh --disk
 
 .PHONY: bcm-stop
 bcm-stop: ## Kill running BCM head node VM
-	@pkill -f "qemu-system.*BCM-11.0" 2>/dev/null && echo "BCM VM stopped." || echo "No BCM VM running."
+	@if [ -f build/.bcm-qemu.pid ] && kill $$(cat build/.bcm-qemu.pid) 2>/dev/null; then \
+		rm -f build/.bcm-qemu.pid; \
+		echo "BCM VM stopped."; \
+	else \
+		rm -f build/.bcm-qemu.pid; \
+		echo "No BCM VM running."; \
+	fi
 
 # ---- Kairos Build & Extract ----
 
@@ -165,7 +180,7 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 	@elapsed=0; \
 	while true; do \
 		KAIROS_IP=$$(sshpass -p "$(BCM_PASSWORD)" ssh $(SSH_OPTS) -p 10022 root@localhost \
-			"grep -oP '10\\.141\\.[0-9]+\\.[0-9]+' /var/lib/misc/dnsmasq.leases 2>/dev/null | head -1" 2>/dev/null); \
+			"grep -oP '(?<=lease )10\\.141\\.[0-9]+\\.[0-9]+' /var/lib/dhcpd/dhcpd.leases 2>/dev/null | tail -1" 2>/dev/null); \
 		if [ -n "$$KAIROS_IP" ]; then \
 			if sshpass -p "$(BCM_PASSWORD)" ssh $(SSH_OPTS) -p 10022 root@localhost \
 				"sshpass -p kairos ssh $(SSH_OPTS) -o ConnectTimeout=3 kairos@$$KAIROS_IP 'echo ok'" >/dev/null 2>&1; then \
@@ -186,12 +201,22 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 # ---- Kairos Deploy & Test ----
 
 .PHONY: kairos-deploy
-kairos-deploy: _require-bcm-password _require-bcm-running ## Upload PXE artifacts to BCM head node
+kairos-deploy: _require-bcm-password _require-bcm-running ## Deploy Kairos as BCM software image (upload + configure)
 	src/test-kairos-pxe.sh --no-launch
 
 .PHONY: kairos-run
-kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node VM (direct kernel boot, blocking)
-	src/test-kairos-pxe.sh --skip-upload --direct
+kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node, wait for BCM provisioning + SSH ready
+	src/test-kairos-pxe.sh --skip-upload --reset-compute
+
+.PHONY: kairos-stop
+kairos-stop: ## Kill running Kairos compute node VM
+	@if [ -f build/.kairos-qemu.pid ] && kill $$(cat build/.kairos-qemu.pid) 2>/dev/null; then \
+		rm -f build/.kairos-qemu.pid; \
+		echo "Kairos VM stopped."; \
+	else \
+		rm -f build/.kairos-qemu.pid; \
+		echo "No Kairos VM running."; \
+	fi
 
 .PHONY: kairos-validate
 kairos-validate: _require-bcm-password _require-bcm-running ## Validate Kairos node through BCM head node
@@ -207,6 +232,14 @@ test: kairos-deploy kairos-run ## Deploy and boot Kairos compute node
 
 .PHONY: validate
 validate: kairos-validate ## Run validation checks on Kairos node
+
+.PHONY: orchestrate
+orchestrate: ## Run full pipeline as parallel DAG (skips steps with existing artifacts)
+	src/orchestrate.sh
+
+.PHONY: orchestrate-clean
+orchestrate-clean: ## Run full pipeline from scratch (clean-all first)
+	src/orchestrate.sh --clean
 
 # ---- Cleanup ----
 
