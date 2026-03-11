@@ -574,7 +574,7 @@ sleep 2
 # ════════════════════════════════════════════════
 
 # kairos-deploy (foreground, blocks until done)
-run_step "kairos-deploy"
+run_step "kairos-deploy" || true
 if [[ "$(get_status "kairos-deploy")" == "fail" ]]; then
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ kairos-deploy failed ═══${NC}"
@@ -606,7 +606,7 @@ sleep 2
 #  Phase 3: Validate
 # ════════════════════════════════════════════════
 
-run_step "validate"
+run_step "validate" || true
 if [[ "$(get_status "validate")" == "fail" ]]; then
     show_status "${ALL_STEPS[@]}"
     echo -e "\n${RED}═══ validate failed ═══${NC}"
