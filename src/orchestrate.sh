@@ -2,9 +2,12 @@
 # orchestrate.sh — Run the full BCM + Kairos pipeline as a parallel DAG
 #
 # DAG:
-#   clean-all ──┬── download-iso → bcm-prepare → bcm-run ──┐
-#               │                                           ├── kairos-deploy → kairos-run → validate
-#               └── kairos-build → kairos-extract ──────────┘
+#   download-iso → bcm-prepare → bcm-run ──┐
+#                                           ├── kairos-deploy → kairos-run → validate
+#   kairos-build → kairos-extract ──────────┘
+#
+# Steps with existing artifacts are skipped automatically.
+# Use --clean to force a full rebuild from scratch.
 #
 # Each step logs to ./logs/orchestrate-<step>.log
 # Shows a compact rolling status (last 5 lines per step, refreshing every 5s).
@@ -16,7 +19,6 @@ cd "$SCRIPT_DIR"
 
 LOG_DIR="./logs"
 STATUS_DIR="./logs/.status"
-mkdir -p "$LOG_DIR" "$STATUS_DIR"
 
 # Colors
 RED='\033[0;31m'
@@ -26,10 +28,23 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Parse args
+FORCE_CLEAN=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --clean) FORCE_CLEAN=true; shift ;;
+        -h|--help)
+            echo "Usage: $0 [--clean]"
+            echo "  --clean   Force full rebuild (runs make clean-all first)"
+            exit 0 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
 # Track background PIDs
 declare -A PIDS
 
-# File-based status (works across subshells)
+# ---- Status tracking (file-based, works across subshells) ----
 set_status() {
     echo "$2" > "${STATUS_DIR}/$1"
 }
@@ -50,16 +65,69 @@ log_file() {
     echo "${LOG_DIR}/orchestrate-${1}.log"
 }
 
-# Run a make target, logging to file. Updates status file on completion.
+# ---- Skip detection ----
+# Returns 0 (true) if a step can be skipped based on existing artifacts.
+can_skip() {
+    local step="$1"
+    case "$step" in
+        download-iso)
+            [[ -f "dist/${ISO_FILENAME}" ]] && [[ $(stat -c%s "dist/${ISO_FILENAME}" 2>/dev/null || echo 0) -gt 1000000 ]]
+            ;;
+        bcm-prepare)
+            [[ -f "build/.bcm-kernel" ]] && [[ -f "build/.bcm-rootfs-auto.cgz" ]] && [[ -f "build/.bcm-init.img" ]]
+            ;;
+        bcm-run)
+            # Skip if disk exists AND BCM VM is already SSH-reachable
+            if [[ -f "build/bcm-disk.qcow2" ]]; then
+                if [[ -f "build/.bcm-qemu.pid" ]] && kill -0 "$(cat build/.bcm-qemu.pid 2>/dev/null)" 2>/dev/null; then
+                    # VM running — check SSH
+                    sshpass -p "${BCM_PASSWORD:-}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                        -o LogLevel=ERROR -o ConnectTimeout=3 -p 10022 root@localhost "echo ok" >/dev/null 2>&1
+                    return $?
+                fi
+                # Disk exists but VM not running — need to start it (use bcm-start instead)
+                return 1
+            fi
+            return 1
+            ;;
+        kairos-build)
+            [[ -f "build/palette-edge-installer.iso" ]]
+            ;;
+        kairos-extract)
+            [[ -d "build/pxe" ]] && [[ -f "build/pxe/rootfs.squashfs" ]] && [[ -f "build/pxe/vmlinuz" ]] && [[ -f "build/pxe/user-data.yaml" ]]
+            ;;
+        kairos-deploy|kairos-run|validate)
+            # These depend on live VM state — never skip
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Run a make target, or skip if artifacts exist.
 run_step() {
     local step="$1"
     local logf
     logf=$(log_file "$step")
-    > "$logf"
 
+    # Check if we can skip
+    if can_skip "$step"; then
+        set_status "$step" "skipped"
+        echo "Skipped: artifacts already present" > "$logf"
+        return 0
+    fi
+
+    > "$logf"
     set_status "$step" "running"
 
-    make "$step" > "$logf" 2>&1
+    # Special case: if bcm-run can be replaced with bcm-start (disk exists, VM not running)
+    if [[ "$step" == "bcm-run" ]] && [[ -f "build/bcm-disk.qcow2" ]]; then
+        make bcm-start > "$logf" 2>&1
+    else
+        make "$step" > "$logf" 2>&1
+    fi
     local rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -81,6 +149,7 @@ show_status() {
         status=$(get_status "$s")
         local icon="⏳"
         [[ "$status" == "done" ]] && icon="✅"
+        [[ "$status" == "skipped" ]] && icon="⏭️ "
         [[ "$status" == "fail" ]] && icon="❌"
         [[ "$status" == "pending" ]] && icon="⏸️ "
         [[ "$status" == "blocked" ]] && icon="🔒"
@@ -101,6 +170,8 @@ show_status() {
             else
                 echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
             fi
+        elif [[ "$status" == "skipped" ]]; then
+            echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
         else
             echo -e "  ${icon} ${BOLD}${s}${NC} [${status}]"
         fi
@@ -111,10 +182,9 @@ show_status() {
     done
 }
 
-# Cleanup on exit: kill all child processes and QEMU VMs
+# ---- Cleanup on exit ----
 cleanup() {
     local exit_code=$?
-    # Avoid recursive traps
     trap - EXIT INT TERM HUP
 
     if [[ $exit_code -ne 0 ]] || [[ "${ORCHESTRATE_INTERRUPTED:-}" == "true" ]]; then
@@ -133,7 +203,6 @@ cleanup() {
     # Stop any QEMU VMs started during this run
     for pidfile in build/.bcm-qemu.pid build/.kairos-qemu.pid; do
         if [[ -f "$pidfile" ]]; then
-            local qpid
             qpid=$(cat "$pidfile" 2>/dev/null)
             if [[ -n "$qpid" ]] && kill -0 "$qpid" 2>/dev/null; then
                 echo -e "  ${YELLOW}Stopping VM ($pidfile)${NC}"
@@ -163,11 +232,12 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM HUP
 
-# ---- Read config for download progress ----
+# ---- Read config ----
 ISO_FILENAME=$(jq -r '.iso_filename // "bcm-11.0-ubuntu2404.iso"' env.json 2>/dev/null || echo "bcm-11.0-ubuntu2404.iso")
 JFROG_INSTANCE=$(jq -r '.jfrog_instance // "insightsoftmax.jfrog.io"' env.json 2>/dev/null || echo "insightsoftmax.jfrog.io")
 JFROG_REPO=$(jq -r '.jfrog_repo // "iso-releases"' env.json 2>/dev/null || echo "iso-releases")
 JFROG_TOKEN=$(jq -r '.jfrog_token // empty' env.json 2>/dev/null || true)
+BCM_PASSWORD=$(jq -r '.bcm_password // empty' env.json 2>/dev/null || true)
 
 # Get ISO size via HEAD request for download progress
 ISO_TOTAL_MB=0
@@ -184,7 +254,17 @@ fi
 # All pipeline steps
 ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-extract" "kairos-deploy" "kairos-run" "validate")
 
-# Initialize all statuses
+# ---- Initialize ----
+mkdir -p "$LOG_DIR" "$STATUS_DIR"
+
+# Clear old status files and orchestrate logs
+rm -rf "$STATUS_DIR"
+mkdir -p "$STATUS_DIR"
+for s in "${ALL_STEPS[@]}"; do
+    rm -f "$(log_file "$s")"
+done
+
+# Set initial statuses
 for s in "${ALL_STEPS[@]}"; do
     set_status "$s" "pending"
 done
@@ -193,10 +273,29 @@ set_status "kairos-run" "blocked"
 set_status "validate" "blocked"
 
 # ════════════════════════════════════════════════
-#  Phase 0: Clean
+#  Phase 0: Clean (optional)
 # ════════════════════════════════════════════════
-banner "Phase 0: Clean slate"
-run_step "clean-all"
+if [[ "$FORCE_CLEAN" == "true" ]]; then
+    banner "Phase 0: Clean slate"
+    make clean-all > "$(log_file clean-all)" 2>&1
+    echo -e "${GREEN}[DONE]${NC} clean-all"
+fi
+
+# ---- Pre-flight skip detection ----
+banner "Checking existing artifacts"
+SKIPPABLE=0
+for s in "${ALL_STEPS[@]}"; do
+    if can_skip "$s"; then
+        echo -e "  ${CYAN}⏭️  ${s}${NC} — artifacts present, will skip"
+        SKIPPABLE=$((SKIPPABLE + 1))
+    else
+        echo -e "  ⏳ ${s} — needs to run"
+    fi
+done
+echo ""
+if [[ $SKIPPABLE -gt 0 ]]; then
+    echo -e "${YELLOW}Skipping ${SKIPPABLE} step(s) with existing artifacts. Use --clean to force rebuild.${NC}"
+fi
 
 # ════════════════════════════════════════════════
 #  Phase 1: Parallel — BCM track + Kairos track
@@ -256,7 +355,7 @@ if [[ "$TRACK_B_OK" != "true" ]]; then
     exit 1
 fi
 
-echo -e "${GREEN}═══ Phase 1 complete: BCM running + Kairos built ═══${NC}"
+echo -e "${GREEN}═══ Phase 1 complete ═══${NC}"
 sleep 2
 
 # ════════════════════════════════════════════════
@@ -289,7 +388,7 @@ if ! wait "${PIDS["kairos-run"]}"; then
     exit 1
 fi
 
-echo -e "${GREEN}═══ Phase 2 complete: Compute node provisioned ═══${NC}"
+echo -e "${GREEN}═══ Phase 2 complete ═══${NC}"
 sleep 2
 
 # ════════════════════════════════════════════════
@@ -304,7 +403,7 @@ if [[ "$(get_status "validate")" == "fail" ]]; then
 fi
 
 # ════════════════════════════════════════════════
-#  Summary
+#  Report
 # ════════════════════════════════════════════════
 banner "Pipeline Complete"
 show_status "${ALL_STEPS[@]}"
@@ -312,15 +411,17 @@ echo ""
 echo -e "${GREEN} All steps passed.${NC}"
 echo ""
 
-# ---- Report ----
 echo -e "${BOLD}── Report ──${NC}"
 echo ""
 
-# Step durations from log timestamps
+# Step durations
 echo -e "${BOLD} Step Durations:${NC}"
 for s in "${ALL_STEPS[@]}"; do
     logf=$(log_file "$s")
-    if [[ -f "$logf" ]]; then
+    status=$(get_status "$s")
+    if [[ "$status" == "skipped" ]]; then
+        printf "   %-20s skipped\n" "$s"
+    elif [[ -f "$logf" ]]; then
         start_ts=$(stat -c%W "$logf" 2>/dev/null || echo 0)
         end_ts=$(stat -c%Y "$logf" 2>/dev/null || echo 0)
         if [[ "$start_ts" -gt 0 && "$end_ts" -gt 0 && "$end_ts" -ge "$start_ts" ]]; then
@@ -363,7 +464,7 @@ else
 fi
 echo ""
 
-# Validation summary (extract from validate log)
+# Validation summary
 validate_log=$(log_file "validate")
 if [[ -f "$validate_log" ]]; then
     echo -e "${BOLD} Validation Summary:${NC}"
@@ -374,6 +475,7 @@ fi
 # Logs
 echo -e "${BOLD} Logs:${NC}"
 for f in "$LOG_DIR"/orchestrate-*.log; do
+    [[ -f "$f" ]] || continue
     step=$(basename "$f" .log | sed 's/orchestrate-//')
     size=$(du -h "$f" | cut -f1)
     echo "   ${step}: ${f} (${size})"

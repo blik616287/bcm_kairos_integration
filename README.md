@@ -50,19 +50,20 @@ On subsequent runs, use `make bcm-start` to boot the head node from its existing
 ### 3. One-Command Orchestration
 
 ```bash
-make orchestrate
+make orchestrate         # Incremental — skips steps with existing artifacts
+make orchestrate-clean   # Full rebuild from scratch
 ```
 
-Runs the entire pipeline as a parallel DAG — both build tracks execute simultaneously, then deploy, provision, and validate run in sequence. A compact rolling status display shows the last 5 lines of each step's log, refreshing every 5 seconds.
+Runs the entire pipeline as a parallel DAG — both build tracks execute simultaneously, then deploy, provision, and validate run in sequence. Steps with existing artifacts (ISO already downloaded, image already built, BCM already installed) are automatically skipped.
 
 ```
 DAG:
-  clean-all ──┬── download-iso → bcm-prepare → bcm-run ──┐
-              │                                           ├── kairos-deploy → kairos-run → validate
-              └── kairos-build → kairos-extract ──────────┘
+  download-iso → bcm-prepare → bcm-run ──┐
+                                          ├── kairos-deploy → kairos-run → validate
+  kairos-build → kairos-extract ──────────┘
 ```
 
-All output is logged to `./logs/orchestrate-<step>.log`. On Ctrl+C, the script traps the signal and cleans up all child processes and QEMU VMs.
+A compact rolling status display refreshes every 5 seconds showing all 8 steps. On Ctrl+C, the script traps the signal and cleans up all child processes and QEMU VMs. All output is logged to `./logs/orchestrate-<step>.log`.
 
 ## Prerequisites
 
@@ -145,7 +146,8 @@ Targets are listed in the order they would typically be run during a full end-to
 | `make all` | Runs the full build pipeline: `download-iso` → `bcm-prepare` → `kairos-build` → `kairos-extract`. Does not launch any VMs. |
 | `make test` | Deploys and boots a Kairos compute node: `kairos-deploy` → `kairos-run`. Requires BCM head node to be running. |
 | `make validate` | Alias for `kairos-validate`. |
-| `make orchestrate` | Runs the entire pipeline as a parallel DAG: clean → build (two parallel tracks) → deploy → provision → validate. Shows rolling status display. Traps Ctrl+C to clean up all child processes and VMs. |
+| `make orchestrate` | Runs the entire pipeline as a parallel DAG. Skips steps whose artifacts already exist (ISO downloaded, image built, BCM installed, etc.). Shows rolling status display. Traps Ctrl+C to clean up all child processes and VMs. |
+| `make orchestrate-clean` | Same as `orchestrate` but runs `clean-all` first to force a full rebuild from scratch. |
 
 ### Cleanup
 
