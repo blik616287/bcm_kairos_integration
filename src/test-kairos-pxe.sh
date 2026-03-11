@@ -161,6 +161,27 @@ CMFB_RESULT=$(${SSH_CMD} "systemctl show cmfirstboot --property=Result --value" 
 if [[ "$CMFB_RESULT" != "success" ]]; then
     echo "[WARN] cmfirstboot result: ${CMFB_RESULT}"
 fi
+
+# Wait for .bashrc MOTD noise to clear — cmfirstboot injects a status check
+# into /root/.bashrc that poisons scp and non-interactive SSH sessions.
+# Even after cmfirstboot finishes, there can be a brief race.
+echo "[..] Waiting for clean shell (no MOTD noise)..."
+motd_elapsed=0
+while true; do
+    SHELL_OUTPUT=$(${SSH_CMD} "echo CLEAN" 2>/dev/null || echo "")
+    if [[ "$SHELL_OUTPUT" == "CLEAN" ]]; then
+        break
+    fi
+    motd_elapsed=$((motd_elapsed + 5))
+    if [[ $motd_elapsed -ge 300 ]]; then
+        echo ""
+        echo "[WARN] .bashrc still producing MOTD after 5 minutes, proceeding anyway"
+        break
+    fi
+    printf "\r  [%dm%02ds] .bashrc still noisy..." $((motd_elapsed / 60)) $((motd_elapsed % 60))
+    sleep 5
+done
+echo ""
 echo "[OK] cmfirstboot complete"
 
 # Wait for key BCM services to be ready
