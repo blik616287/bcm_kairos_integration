@@ -289,17 +289,20 @@ cleanup() {
         fi
     done
 
-    # Stop any QEMU VMs started during this run
-    for pidfile in build/.bcm-qemu.pid build/.kairos-qemu.pid; do
-        if [[ -f "$pidfile" ]]; then
-            qpid=$(cat "$pidfile" 2>/dev/null)
-            if [[ -n "$qpid" ]] && kill -0 "$qpid" 2>/dev/null; then
-                echo -e "  ${YELLOW}Stopping VM ($pidfile)${NC}"
-                kill "$qpid" 2>/dev/null || true
-                rm -f "$pidfile"
+    # Only stop QEMU VMs if user interrupted (Ctrl+C), not on step failure.
+    # On failure, leave VMs running so the user can debug or retry.
+    if [[ "${ORCHESTRATE_INTERRUPTED:-}" == "true" ]]; then
+        for pidfile in build/.bcm-qemu.pid build/.kairos-qemu.pid; do
+            if [[ -f "$pidfile" ]]; then
+                qpid=$(cat "$pidfile" 2>/dev/null)
+                if [[ -n "$qpid" ]] && kill -0 "$qpid" 2>/dev/null; then
+                    echo -e "  ${YELLOW}Stopping VM ($pidfile)${NC}"
+                    kill "$qpid" 2>/dev/null || true
+                    rm -f "$pidfile"
+                fi
             fi
-        fi
-    done
+        done
+    fi
 
     # Kill any remaining children of this script
     jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true

@@ -139,13 +139,44 @@ echo "[OK] BCM head node is reachable"
 # Wait for cmfirstboot to finish — BCM services aren't ready until it completes
 echo "[..] Waiting for cmfirstboot to complete..."
 elapsed=0
-while ${SSH_CMD} "systemctl is-active cmfirstboot" 2>/dev/null | grep -q "activating"; do
+while true; do
+    CMFB_STATUS=$(${SSH_CMD} "systemctl is-active cmfirstboot" 2>/dev/null || echo "unknown")
+    if [[ "$CMFB_STATUS" != "activating" && "$CMFB_STATUS" != "active" ]]; then
+        break
+    fi
     elapsed=$((elapsed + 10))
     printf "\r  [%dm%02ds] cmfirstboot still running..." $((elapsed / 60)) $((elapsed % 60))
     sleep 10
 done
 echo ""
+
+# Verify cmfirstboot completed successfully (not failed)
+CMFB_RESULT=$(${SSH_CMD} "systemctl show cmfirstboot --property=Result --value" 2>/dev/null || echo "unknown")
+if [[ "$CMFB_RESULT" != "success" ]]; then
+    echo "[WARN] cmfirstboot result: ${CMFB_RESULT}"
+fi
 echo "[OK] cmfirstboot complete"
+
+# Wait for key BCM services to be ready (cmd, CMDaemon)
+echo "[..] Waiting for BCM services..."
+elapsed=0
+while true; do
+    CMD_STATUS=$(${SSH_CMD} "systemctl is-active cmd" 2>/dev/null || echo "inactive")
+    CMDAEMON_STATUS=$(${SSH_CMD} "systemctl is-active cmdaemon" 2>/dev/null || echo "inactive")
+    if [[ "$CMD_STATUS" == "active" ]] && [[ "$CMDAEMON_STATUS" == "active" ]]; then
+        break
+    fi
+    elapsed=$((elapsed + 5))
+    if [[ $elapsed -ge 300 ]]; then
+        echo ""
+        echo "ERROR: BCM services not ready after 5 minutes (cmd=${CMD_STATUS}, cmdaemon=${CMDAEMON_STATUS})"
+        exit 1
+    fi
+    printf "\r  [%dm%02ds] cmd=%s cmdaemon=%s" $((elapsed / 60)) $((elapsed % 60)) "$CMD_STATUS" "$CMDAEMON_STATUS"
+    sleep 5
+done
+echo ""
+echo "[OK] BCM services ready (cmd + cmdaemon active)"
 
 # ---- Deploy Kairos as BCM software image ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
