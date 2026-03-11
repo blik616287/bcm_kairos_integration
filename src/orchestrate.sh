@@ -467,7 +467,7 @@ fi
 # ---- Pre-flight status ----
 banner "Pre-flight check"
 
-if [[ ${#DIRTY_STEPS[@]} -gt 0 ]]; then
+if [[ -n "${!DIRTY_STEPS[*]+x}" ]]; then
     echo -e "${YELLOW}Steps invalidated:${NC}"
     for s in "${!DIRTY_STEPS[@]}"; do
         echo -e "  ${YELLOW}→ ${s}${NC}"
@@ -497,7 +497,7 @@ if [[ $SKIPPABLE -gt 0 ]]; then
 fi
 
 # Clean artifacts for dirty steps so they rebuild cleanly
-for s in "${!DIRTY_STEPS[@]}"; do
+for s in ${!DIRTY_STEPS[@]+"${!DIRTY_STEPS[@]}"}; do
     case "$s" in
         bcm-prepare)
             rm -f build/.bcm-kernel build/.bcm-rootfs-auto.cgz build/.bcm-init.img ;;
