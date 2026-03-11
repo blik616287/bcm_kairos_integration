@@ -311,16 +311,74 @@ show_status "${ALL_STEPS[@]}"
 echo ""
 echo -e "${GREEN} All steps passed.${NC}"
 echo ""
-echo " Logs:"
+
+# ---- Report ----
+echo -e "${BOLD}── Report ──${NC}"
+echo ""
+
+# Step durations from log timestamps
+echo -e "${BOLD} Step Durations:${NC}"
+for s in "${ALL_STEPS[@]}"; do
+    logf=$(log_file "$s")
+    if [[ -f "$logf" ]]; then
+        start_ts=$(stat -c%W "$logf" 2>/dev/null || echo 0)
+        end_ts=$(stat -c%Y "$logf" 2>/dev/null || echo 0)
+        if [[ "$start_ts" -gt 0 && "$end_ts" -gt 0 && "$end_ts" -ge "$start_ts" ]]; then
+            duration_s=$(( end_ts - start_ts ))
+            printf "   %-20s %dm%02ds\n" "$s" $((duration_s / 60)) $((duration_s % 60))
+        else
+            printf "   %-20s --\n" "$s"
+        fi
+    fi
+done
+echo ""
+
+# Artifacts
+echo -e "${BOLD} Artifacts:${NC}"
+if [[ -f "dist/${ISO_FILENAME}" ]]; then
+    echo "   BCM ISO:          dist/${ISO_FILENAME} ($(du -h "dist/${ISO_FILENAME}" | cut -f1))"
+fi
+if [[ -f "build/bcm-disk.qcow2" ]]; then
+    echo "   BCM disk:         build/bcm-disk.qcow2 ($(du -h "build/bcm-disk.qcow2" | cut -f1))"
+fi
+if [[ -f "build/compute-node-disk.qcow2" ]]; then
+    echo "   Compute disk:     build/compute-node-disk.qcow2 ($(du -h "build/compute-node-disk.qcow2" | cut -f1))"
+fi
+if [[ -d "build/pxe" ]]; then
+    echo "   PXE artifacts:    build/pxe/ ($(du -sh "build/pxe" | cut -f1))"
+fi
+echo ""
+
+# VM status
+echo -e "${BOLD} VMs Running:${NC}"
+if [[ -f "build/.bcm-qemu.pid" ]] && kill -0 "$(cat build/.bcm-qemu.pid 2>/dev/null)" 2>/dev/null; then
+    echo "   BCM head node:    localhost:10022 (SSH), localhost:10443 (HTTPS)"
+else
+    echo "   BCM head node:    not running"
+fi
+if [[ -f "build/.kairos-qemu.pid" ]] && kill -0 "$(cat build/.kairos-qemu.pid 2>/dev/null)" 2>/dev/null; then
+    echo "   Kairos compute:   running (via BCM internal network)"
+else
+    echo "   Kairos compute:   not running"
+fi
+echo ""
+
+# Validation summary (extract from validate log)
+validate_log=$(log_file "validate")
+if [[ -f "$validate_log" ]]; then
+    echo -e "${BOLD} Validation Summary:${NC}"
+    grep -E "^\s*(PASS|WARN|FAIL|Result):" "$validate_log" 2>/dev/null | sed 's/^/   /' || true
+    echo ""
+fi
+
+# Logs
+echo -e "${BOLD} Logs:${NC}"
 for f in "$LOG_DIR"/orchestrate-*.log; do
     step=$(basename "$f" .log | sed 's/orchestrate-//')
     size=$(du -h "$f" | cut -f1)
     echo "   ${step}: ${f} (${size})"
 done
 echo ""
-echo " VMs running:"
-echo "   BCM head node:  localhost:10022 (SSH), localhost:10443 (HTTPS)"
-echo "   Kairos compute: 10.141.0.1 (via BCM)"
-echo ""
+
 echo " To tear down:"
 echo "   make kairos-stop && make bcm-stop"
