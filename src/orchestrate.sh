@@ -88,8 +88,6 @@ detect_dirty_steps() {
                 DIRTY_STEPS[bcm-run]=1 ;;
             src/build-canvos.sh|src/canvos/*|src/canvos/**)
                 DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1 ;;
-            CanvOS|CanvOS/*)
-                DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1 ;;
             src/extract-kairos-pxe.sh)
                 DIRTY_STEPS[kairos-extract]=1 ;;
             src/test-kairos-pxe.sh)
