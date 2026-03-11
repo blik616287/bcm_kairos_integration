@@ -109,6 +109,17 @@ wait_for_ssh() {
     done
     echo ""
     echo "[OK] BCM head node is SSH-ready (${elapsed}s)"
+
+    # Wait for cmfirstboot to finish — BCM services aren't ready until it completes
+    echo "[..] Waiting for cmfirstboot to complete..."
+    while sshpass -p "${BCM_PASSWORD}" ssh ${SSH_OPTS} -o ConnectTimeout=3 -p "${SSH_PORT}" root@localhost \
+        "systemctl is-active cmfirstboot" 2>/dev/null | grep -q "activating"; do
+        elapsed=$((elapsed + 10))
+        printf "\r  [%dm%02ds] cmfirstboot still running..." $((elapsed / 60)) $((elapsed % 60))
+        sleep 10
+    done
+    echo ""
+    echo "[OK] cmfirstboot complete (${elapsed}s total)"
 }
 
 # ---- Preflight ----

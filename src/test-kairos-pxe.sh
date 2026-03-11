@@ -101,7 +101,7 @@ done
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SSH_CMD="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${SSH_PORT} root@localhost"
-SCP_CMD="sshpass -p ${BCM_PASSWORD} scp ${SSH_OPTS} -P ${SSH_PORT}"
+SCP_CMD="sshpass -p ${BCM_PASSWORD} scp -O ${SSH_OPTS} -P ${SSH_PORT}"
 
 # ---- Preflight ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
@@ -135,6 +135,17 @@ if ! ${SSH_CMD} "echo ok" &>/dev/null; then
     exit 1
 fi
 echo "[OK] BCM head node is reachable"
+
+# Wait for cmfirstboot to finish — BCM services aren't ready until it completes
+echo "[..] Waiting for cmfirstboot to complete..."
+elapsed=0
+while ${SSH_CMD} "systemctl is-active cmfirstboot" 2>/dev/null | grep -q "activating"; do
+    elapsed=$((elapsed + 10))
+    printf "\r  [%dm%02ds] cmfirstboot still running..." $((elapsed / 60)) $((elapsed % 60))
+    sleep 10
+done
+echo ""
+echo "[OK] cmfirstboot complete"
 
 # ---- Deploy Kairos as BCM software image ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
