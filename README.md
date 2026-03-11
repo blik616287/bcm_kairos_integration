@@ -54,7 +54,7 @@ make orchestrate         # Incremental — skips steps with existing artifacts
 make orchestrate-clean   # Full rebuild from scratch
 ```
 
-Runs the entire pipeline as a parallel DAG — both build tracks execute simultaneously, then deploy, provision, and validate run in sequence. Steps with existing artifacts (ISO already downloaded, image already built, BCM already installed) are automatically skipped.
+Runs the entire pipeline as a parallel DAG with a unified rolling status display.
 
 ```
 DAG:
@@ -63,7 +63,19 @@ DAG:
   kairos-build → kairos-extract ──────────┘
 ```
 
-A compact rolling status display refreshes every 5 seconds showing all 8 steps. On Ctrl+C, the script traps the signal and cleans up all child processes and QEMU VMs. All output is logged to `./logs/orchestrate-<step>.log`.
+**Phases:**
+
+1. **Phase 1 — Build (parallel):** Track A (download-iso → bcm-prepare → bcm-run) and Track B (kairos-build → kairos-extract) run simultaneously
+2. **Phase 2 — Deploy + Provision (sequential):** kairos-deploy uploads and configures the image on BCM, then kairos-run launches the compute VM and waits for provisioning + Palette registration
+3. **Phase 3 — Validate:** Runs health checks on the provisioned compute node
+
+**Incremental builds:** Steps with existing artifacts are automatically skipped. The orchestrator detects uncommitted file changes and invalidates only the affected steps, cascading downstream through the DAG. For example, editing `src/build-canvos.sh` invalidates kairos-build → kairos-extract → kairos-deploy → kairos-run. The ISO is checked by sha256 against JFrog rather than file changes. BCM and Kairos VMs that are already running are reused.
+
+**Status display:** A compact rolling display refreshes every 5 seconds showing all 8 steps with their current state (pending/running/done/skipped/fail/blocked) and the last 5 lines of output from each running step. ISO download shows progress as a percentage.
+
+**Dependencies:** On startup, the orchestrator checks for required apt packages (`jq`, `qemu`, `docker`, `sshpass`, etc.) and auto-installs any that are missing. It also initializes the CanvOS submodule if needed.
+
+**Cleanup:** On Ctrl+C, the script traps the signal and kills all child processes and QEMU VMs. On step failure, VMs are left running for debugging. All output is logged to `./logs/orchestrate-<step>.log`.
 
 ## Prerequisites
 
@@ -146,7 +158,7 @@ Targets are listed in the order they would typically be run during a full end-to
 | `make all` | Runs the full build pipeline: `download-iso` → `bcm-prepare` → `kairos-build` → `kairos-extract`. Does not launch any VMs. |
 | `make test` | Deploys and boots a Kairos compute node: `kairos-deploy` → `kairos-run`. Requires BCM head node to be running. |
 | `make validate` | Alias for `kairos-validate`. |
-| `make orchestrate` | Runs the entire pipeline as a parallel DAG. Skips steps whose artifacts already exist (ISO downloaded, image built, BCM installed, etc.). Shows rolling status display. Traps Ctrl+C to clean up all child processes and VMs. |
+| `make orchestrate` | Runs the entire pipeline as a parallel DAG with rolling status display. Detects uncommitted file changes and invalidates affected steps. Skips steps with existing artifacts. Auto-installs missing apt dependencies. Traps Ctrl+C to clean up child processes and VMs. |
 | `make orchestrate-clean` | Same as `orchestrate` but runs `clean-all` first to force a full rebuild from scratch. |
 
 ### Cleanup
@@ -196,9 +208,10 @@ Targets are listed in the order they would typically be run during a full end-to
 │       └── kairos-boot.ipxe         # iPXE boot script
 ├── dist/                             # Downloaded ISOs (gitignored)
 │   └── bcm-11.0-ubuntu2404.iso
-└── logs/                             # Serial console logs (gitignored)
-    ├── bcm-serial.log
-    └── kairos-serial.log
+└── logs/                             # Logs (gitignored)
+    ├── bcm-serial.log                # BCM VM serial console
+    ├── kairos-serial.log             # Kairos VM serial console
+    └── orchestrate-<step>.log        # Per-step orchestrate output
 ```
 
 ---
@@ -430,7 +443,7 @@ The compute node gets a DHCP address from BCM on the 10.141.0.0/16 internal netw
 
 - **OS & Kairos**: OS release, kairos-agent binary, immucore version
 - **Kernel & Boot**: Kernel version, boot parameters, squashfs mount
-- **Services**: k3s, kairos-agent, stylus-agent status, SSH, networking
+- **Services**: k3s, kairos-agent, stylus-agent status, Palette registration, SSH, networking
 
 ### Network Details
 
