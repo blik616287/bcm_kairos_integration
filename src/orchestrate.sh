@@ -68,7 +68,7 @@ log_file() {
 # ---- Dirty file detection ----
 # Maps uncommitted file changes to the steps they would invalidate.
 # Populates DIRTY_STEPS associative array.
-declare -A DIRTY_STEPS
+declare -A DIRTY_STEPS=()
 
 detect_dirty_steps() {
     # Collect all uncommitted changes (staged, unstaged, untracked)
@@ -110,7 +110,8 @@ is_dirty() {
 }
 
 has_dirty_steps() {
-    [[ ${#DIRTY_STEPS[@]} -gt 0 ]] 2>/dev/null || return 1
+    local count="${#DIRTY_STEPS[@]}"
+    [[ "$count" -gt 0 ]]
 }
 
 # Cascade: if a step is dirty, downstream build steps must also rebuild.
