@@ -22,6 +22,15 @@ RAM="8192"
 CPUS="4"
 VM_NAME="BCM-11.0"
 
+# Display: use gtk if DISPLAY or WAYLAND_DISPLAY is set, otherwise headless
+if [[ -z "${QEMU_DISPLAY:-}" ]]; then
+    if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        QEMU_DISPLAY="gtk"
+    else
+        QEMU_DISPLAY="none"
+    fi
+fi
+
 # Port forwarding (host -> VM)
 SSH_PORT=10022
 HTTPS_PORT=10443
@@ -158,7 +167,7 @@ QEMU_COMMON=(
     -netdev user,id=extnet,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${HTTPS_PORT}-:443
     -device virtio-net-pci,netdev=extnet,mac=52:54:00:00:01:02
     -vga virtio
-    -display gtk
+    -display "${QEMU_DISPLAY:-none}"
     -chardev stdio,id=char0,mux=on,logfile="${SERIAL_LOG}"
     -serial chardev:char0
     -mon chardev=char0
