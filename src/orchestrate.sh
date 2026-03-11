@@ -109,6 +109,10 @@ is_dirty() {
     [[ -n "${DIRTY_STEPS[$1]:-}" ]]
 }
 
+has_dirty_steps() {
+    [[ ${#DIRTY_STEPS[@]} -gt 0 ]] 2>/dev/null || return 1
+}
+
 # Cascade: if a step is dirty, downstream build steps must also rebuild.
 # bcm-run and kairos-run are live VM steps — skip if already running, never invalidated.
 # validate always runs regardless.
@@ -467,7 +471,7 @@ fi
 # ---- Pre-flight status ----
 banner "Pre-flight check"
 
-if [[ -n "${!DIRTY_STEPS[*]+x}" ]]; then
+if has_dirty_steps; then
     echo -e "${YELLOW}Steps invalidated:${NC}"
     for s in "${!DIRTY_STEPS[@]}"; do
         echo -e "  ${YELLOW}→ ${s}${NC}"
@@ -497,7 +501,8 @@ if [[ $SKIPPABLE -gt 0 ]]; then
 fi
 
 # Clean artifacts for dirty steps so they rebuild cleanly
-for s in ${!DIRTY_STEPS[@]+"${!DIRTY_STEPS[@]}"}; do
+if has_dirty_steps; then
+for s in "${!DIRTY_STEPS[@]}"; do
     case "$s" in
         bcm-prepare)
             rm -f build/.bcm-kernel build/.bcm-rootfs-auto.cgz build/.bcm-init.img ;;
@@ -510,6 +515,7 @@ for s in ${!DIRTY_STEPS[@]+"${!DIRTY_STEPS[@]}"}; do
             rm -rf build/pxe/ ;;
     esac
 done
+fi
 
 # ════════════════════════════════════════════════
 #  Phase 1: Parallel — BCM track + Kairos track
