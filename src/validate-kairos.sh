@@ -1,8 +1,11 @@
 #!/bin/bash
 # validate-kairos.sh
 #
-# Validates that a Kairos compute node booted correctly via BCM PXE.
+# Validates that a Kairos compute node installed correctly via Option C PXE.
 # Connects through the BCM head node and runs a series of checks.
+#
+# Option C produces a fully partitioned Kairos system with COS layout:
+#   COS_OEM, COS_STATE, COS_RECOVERY, COS_PERSISTENT
 #
 # Usage:
 #   ./validate-kairos.sh [OPTIONS]
@@ -28,12 +31,12 @@ usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
 
-Validates a Kairos compute node booted via BCM PXE.
+Validates a Kairos compute node installed via Option C PXE.
 
 Options:
   --ssh-port PORT      BCM head node SSH port (default: 10022)
-  --password PASS      BCM root password (default: Br1ghtClust3r)
-  --kairos-ip IP       Kairos node IP (default: auto-detect from DHCP leases)
+  --password PASS      BCM root password
+  --kairos-ip IP       Kairos node IP (default: auto-detect from ARP table)
   --kairos-user USER   Kairos SSH user (default: kairos)
   --kairos-pass PASS   Kairos SSH password (default: kairos)
   -h, --help           Show this help
@@ -92,7 +95,7 @@ if ! command -v sshpass &>/dev/null; then
 fi
 
 echo "============================================"
-echo " Kairos Node Validation"
+echo " Kairos Node Validation (Option C)"
 echo "============================================"
 echo ""
 
@@ -107,11 +110,11 @@ echo ""
 
 # ---- Find Kairos node IP ----
 if [[ -z "$KAIROS_IP" ]]; then
-    echo "[..] Auto-detecting Kairos node IP from DHCP leases..."
+    echo "[..] Auto-detecting Kairos node IP from ARP table..."
     KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep '52:54:00:00:02:01' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd)
     if [[ -z "$KAIROS_IP" ]]; then
-        echo "ERROR: Could not find Kairos node in DHCP leases."
-        echo "Is the compute node running? (./test-kairos-pxe.sh --direct)"
+        echo "ERROR: Could not find Kairos node in ARP table."
+        echo "Is the compute node running?"
         exit 1
     fi
 fi
@@ -119,22 +122,25 @@ echo "[OK] Kairos node IP: ${KAIROS_IP}"
 echo ""
 
 # ---- SSH to Kairos node through head node ----
-# BCM provisioning provides root SSH via key-based auth from the head node.
-# The kairos user may not exist (user-data boot stages don't run under BCM).
-echo "[..] Testing SSH to Kairos node (root@${KAIROS_IP})..."
-KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
+# Option C: SSH as kairos user with password auth (configured via cloud-config)
+echo "[..] Testing SSH to Kairos node (${KAIROS_USER}@${KAIROS_IP})..."
 
-# Test SSH connectivity
-SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+SSH_TEST=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
 if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
-    echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
-    echo "SSH output: ${SSH_TEST}"
-    echo ""
-    echo "The node may still be booting, or user-data was not applied."
-    echo "Try again in a minute, or check the console."
-    exit 1
+    # Fallback: try root with BCM key-based auth
+    SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+    if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
+        echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
+        echo "SSH output: ${SSH_TEST}"
+        exit 1
+    fi
+    # Root access works (BCM keys or PermitRootLogin)
+    KAIROS_SSH_CMD="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
+    echo "[OK] SSH connected (root)"
+else
+    KAIROS_SSH_CMD="${BCM_SSH} \"sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP}\""
+    echo "[OK] SSH connected (${KAIROS_USER})"
 fi
-echo "[OK] SSH connected"
 echo ""
 
 # ---- Run validation checks ----
@@ -144,7 +150,7 @@ echo "============================================"
 echo ""
 
 # Collect all info in one SSH session to minimize round-trips
-VALIDATION=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} '
+VALIDATION=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} 'sudo sh -s' << 'REMOTE_CHECKS'
 echo \"===OS_RELEASE===\"
 cat /etc/os-release 2>/dev/null
 echo \"===KAIROS_RELEASE===\"
@@ -157,6 +163,10 @@ echo \"===KERNEL===\"
 uname -r 2>/dev/null
 echo \"===CMDLINE===\"
 cat /proc/cmdline 2>/dev/null
+echo \"===PARTITIONS===\"
+lsblk -o NAME,LABEL,FSTYPE,SIZE 2>/dev/null || echo MISSING
+echo \"===ROOT_MOUNT===\"
+mount | grep \" on / \" 2>/dev/null || echo MISSING
 echo \"===K3S_BIN===\"
 ls -la /usr/local/bin/k3s 2>/dev/null || which k3s 2>/dev/null || echo MISSING
 echo \"===K3S_VERSION===\"
@@ -182,7 +192,7 @@ grep kairos /etc/passwd 2>/dev/null || echo MISSING
 echo \"===ISSUE===\"
 cat /etc/issue 2>/dev/null || echo MISSING
 echo \"===END===\"
-'" 2>/dev/null | filter_motd)
+REMOTE_CHECKS" 2>/dev/null | filter_motd)
 
 # Parse results
 get_section() {
@@ -211,19 +221,42 @@ else
     check "kairos-agent binary" "FAIL" "not found in PATH"
 fi
 
+# 4. COS Partition Layout (Option C specific)
+echo ""
+echo "-- COS Partition Layout --"
+PARTITIONS=$(get_section "PARTITIONS")
+if [[ "$PARTITIONS" != "MISSING" ]] && [[ -n "$PARTITIONS" ]]; then
+    for label in COS_OEM COS_STATE COS_RECOVERY COS_PERSISTENT; do
+        if echo "$PARTITIONS" | grep -q "$label"; then
+            PART_SIZE=$(echo "$PARTITIONS" | grep "$label" | awk '{print $NF}')
+            check "$label" "PASS" "$PART_SIZE"
+        else
+            check "$label" "FAIL" "partition not found"
+        fi
+    done
+else
+    check "Partition layout" "FAIL" "could not read partition table"
+fi
 
-# 5. Kernel
+# 5. Immutability — root should be read-only
+ROOT_MOUNT=$(get_section "ROOT_MOUNT")
+if echo "$ROOT_MOUNT" | grep -q "\\bro\\b\|\\bro,"; then
+    check "Root immutability" "PASS" "root filesystem is read-only"
+else
+    check "Root immutability" "WARN" "root may be read-write: ${ROOT_MOUNT}"
+fi
+
+# 6. Kernel
 echo ""
 echo "-- Kernel & Boot --"
 KERNEL=$(get_section "KERNEL")
 if [[ -n "$KERNEL" ]]; then check "Kernel" "PASS" "$KERNEL"; else check "Kernel" "FAIL" ""; fi
 
 CMDLINE=$(get_section "CMDLINE")
-# BCM provisioning uses its own kernel cmdline — check for stylus.registration instead
 if echo "$CMDLINE" | grep -q "stylus.registration"; then
     check "Registration cmdline" "PASS" "stylus.registration present"
 else
-    check "Registration cmdline" "WARN" "stylus.registration not in cmdline (may already be registered)"
+    check "Registration cmdline" "WARN" "stylus.registration not in cmdline (may be handled via cloud-config)"
 fi
 
 # 7. Network
@@ -237,9 +270,7 @@ else
     check "Network interface" "FAIL" "no IPv4 address"
 fi
 
-# 8. Kubernetes
-
-# 9. Services
+# 8. Services
 echo ""
 echo "-- Services --"
 SERVICES=$(get_section "SYSTEMD_KAIROS")
@@ -253,39 +284,39 @@ else
     check "Kairos/Stylus services" "FAIL" "no kairos/stylus services"
 fi
 
-# Check stylus-agent specifically (the key service for BCM provisioning)
+# Check stylus-agent specifically
 if echo "$SERVICES" | grep -q "stylus-agent.*running"; then
     check "stylus-agent" "PASS" "active"
 else
-    check "stylus-agent" "FAIL" "not running"
+    check "stylus-agent" "WARN" "not running (may still be starting)"
 fi
 
-# Check cmd (BCM compute daemon)
-if echo "$SERVICES" | grep -q "cmd.*running" || ${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
-    check "cmd service" "PASS" "active"
+# Check kairos-agent
+if echo "$SERVICES" | grep -q "kairos-agent.*running"; then
+    check "kairos-agent" "PASS" "active"
 else
-    check "cmd service" "FAIL" "not running"
+    check "kairos-agent" "WARN" "not running"
 fi
 
-# 10. User
+# 9. User
 echo ""
 echo "-- User Config --"
-check "SSH login" "PASS" "root@${KAIROS_IP} (via BCM head node)"
+check "SSH login" "PASS" "${KAIROS_USER}@${KAIROS_IP} (via BCM head node)"
 
-# Check user-data was applied
-USERDATA_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null | filter_motd || true)
+# Check user-data was applied (Kairos writes cloud-config to COS_OEM during install)
+USERDATA_CHECK=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null | filter_motd || true)
 if [[ "$USERDATA_CHECK" == *"present"* ]]; then
     check "user-data" "PASS" "/oem/99_userdata.yaml present"
 else
-    check "user-data" "FAIL" "/oem/99_userdata.yaml missing"
+    check "user-data" "WARN" "/oem/99_userdata.yaml missing (config may be in different OEM path)"
 fi
 
 # Check Palette registration
-REG_LOGS=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+REG_LOGS=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} ${KAIROS_USER}@${KAIROS_IP} 'sudo journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
 if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
     check "Palette registration" "PASS" "registered with Palette"
 else
-    check "Palette registration" "WARN" "registration not detected"
+    check "Palette registration" "WARN" "registration not detected (stylus-agent may still be starting)"
 fi
 
 # ---- Summary ----

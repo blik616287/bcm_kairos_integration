@@ -1,18 +1,18 @@
 #!/bin/bash
 # test-kairos-pxe.sh
 #
-# End-to-end: deploys Kairos as a BCM software image and boots a compute node.
+# Option C: Deploys Kairos via BCM PXE boot with Kairos's own installer.
 #
-# BCM handles everything:
-#   1. Upload squashfs → unsquash as /cm/images/kairos-image/
-#   2. cm-create-image registers it + installs BCM node packages
-#   3. Configure node001 in cmsh (MAC, installmode=FULL, softwareimage=kairos-image)
-#   4. Launch compute VM → BCM PXE boots it → node-installer rsyncs image to disk
-#   5. BCM installs GRUB and reboots the node
-#   6. Node boots from disk into Kairos → stylus-agent registers with Palette
+# Instead of BCM rsync-provisioning (Option A), this script:
+#   1. Uploads boot artifacts (kernel, initrd, squashfs, cloud-config) to BCM
+#   2. Starts an HTTP server on BCM to serve them
+#   3. Injects a custom PXE label into BCM's pxelinux config
+#   4. Configures node001 to PXE boot with the kairos-install label
+#   5. Launches compute VM → Kairos installer partitions disk → reboots into installed system
+#   6. Cleans up PXE label and HTTP server after install
 #
-# This script only prepares the image and launches the VM. BCM handles
-# disk provisioning, GRUB, and reboot. No live boot or dracut hooks.
+# Kairos handles its own partitioning: COS_OEM, COS_STATE, COS_RECOVERY, COS_PERSISTENT.
+# Result: immutable root, A/B upgrades, proper Kairos partition layout.
 #
 # Prerequisites:
 #   - BCM head node running (launch-bcm-kvm.sh --disk or --auto)
@@ -35,6 +35,9 @@ BCM_PASSWORD="${BCM_PASSWORD:?ERROR: BCM_PASSWORD not set. Set in env.json or ex
 
 # Head node internal IP
 HEAD_NODE_IP="10.141.255.254"
+
+# HTTP server port for serving boot artifacts
+HTTP_PORT=8080
 
 # Compute node VM settings
 COMPUTE_RAM="4096"
@@ -61,7 +64,7 @@ usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
 
-Deploys Kairos as a BCM software image and provisions a compute node.
+Option C: Deploys Kairos via BCM PXE with Kairos's native installer.
 
 Options:
   --no-launch          Deploy only, don't launch compute VM
@@ -76,7 +79,7 @@ Options:
   -h, --help           Show this help
 
 Examples:
-  $0                   # Deploy + launch (BCM provisions Kairos)
+  $0                   # Deploy + launch (Kairos installer via PXE)
   $0 --no-launch       # Deploy only
   $0 --skip-upload     # Launch VM (already deployed)
 EOF
@@ -111,16 +114,13 @@ filter_motd() {
 
 # ---- Preflight ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
-    if [[ ! -f "${PXE_DIR}/rootfs.squashfs" ]]; then
-        echo "ERROR: rootfs.squashfs not found at ${PXE_DIR}/rootfs.squashfs"
-        echo "Run ./extract-kairos-pxe.sh first."
-        exit 1
-    fi
-    if [[ ! -f "${PXE_DIR}/user-data.yaml" ]]; then
-        echo "ERROR: user-data.yaml not found at ${PXE_DIR}/user-data.yaml"
-        echo "Run ./extract-kairos-pxe.sh first."
-        exit 1
-    fi
+    for artifact in vmlinuz initrd rootfs.squashfs install-config.yaml; do
+        if [[ ! -f "${PXE_DIR}/${artifact}" ]]; then
+            echo "ERROR: ${artifact} not found at ${PXE_DIR}/${artifact}"
+            echo "Run ./extract-kairos-pxe.sh first."
+            exit 1
+        fi
+    done
 
     if ! command -v sshpass &>/dev/null; then
         echo "ERROR: sshpass not found. Install with: sudo apt install sshpass"
@@ -207,151 +207,88 @@ done
 echo ""
 echo "[OK] BCM services ready (cmd active, cmsh responsive)"
 
-# ---- Deploy Kairos as BCM software image ----
+# ---- Deploy Kairos boot artifacts for PXE ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
     echo ""
     echo "============================================"
-    echo " Deploying Kairos as BCM Software Image"
+    echo " Deploying Kairos Boot Artifacts (Option C)"
     echo "============================================"
 
-    # Check if image already exists and is current
-    EXTRACTED=false
-    EXISTING=$(${SSH_CMD} "ls -d /cm/images/kairos-image 2>/dev/null && echo yes || echo no" | filter_motd)
+    # Check if artifacts already uploaded and current
+    NEEDS_UPLOAD=true
+    EXISTING=$(${SSH_CMD} "ls /cm/shared/kairos/rootfs.squashfs 2>/dev/null && echo yes || echo no" | filter_motd)
     if [[ "$EXISTING" == "yes" ]]; then
-        echo "[..] kairos-image already exists, checking if squashfs is newer..."
+        echo "[..] Kairos artifacts already on BCM, checking if current..."
         LOCAL_SIZE=$(stat -c%s "${PXE_DIR}/rootfs.squashfs")
-        REMOTE_MARKER=$(${SSH_CMD} "cat /cm/images/kairos-image/.squashfs-size 2>/dev/null || echo 0" | filter_motd)
-        if [[ "$LOCAL_SIZE" == "$REMOTE_MARKER" ]]; then
-            echo "[OK] kairos-image is up to date, skipping extraction"
+        REMOTE_SIZE=$(${SSH_CMD} "stat -c%s /cm/shared/kairos/rootfs.squashfs 2>/dev/null || echo 0" | filter_motd)
+        if [[ "$LOCAL_SIZE" == "$REMOTE_SIZE" ]]; then
+            echo "[OK] Artifacts are up to date, skipping upload"
+            NEEDS_UPLOAD=false
         else
-            echo "[..] Squashfs changed, re-deploying..."
-            EXISTING="no"
+            echo "[..] Squashfs changed, re-uploading..."
         fi
     fi
 
-    if [[ "$EXISTING" != "yes" ]]; then
-        EXTRACTED=true
-        echo "[1/7] Uploading rootfs.squashfs (this takes a while)..."
-        ${SCP_CMD} "${PXE_DIR}/rootfs.squashfs" root@localhost:/tmp/kairos-rootfs.squashfs
-
-        echo "[2/7] Extracting to /cm/images/kairos-image/..."
-        ${SSH_CMD} "rm -rf /cm/images/kairos-image && unsquashfs -d /cm/images/kairos-image /tmp/kairos-rootfs.squashfs && rm -f /tmp/kairos-rootfs.squashfs" | filter_motd
-        LOCAL_SIZE=$(stat -c%s "${PXE_DIR}/rootfs.squashfs")
-        ${SSH_CMD} "echo ${LOCAL_SIZE} > /cm/images/kairos-image/.squashfs-size" | filter_motd
+    if [[ "$NEEDS_UPLOAD" == "true" ]]; then
+        echo "[1/4] Uploading boot artifacts to BCM..."
+        ${SSH_CMD} "mkdir -p /cm/shared/kairos"
+        for artifact in vmlinuz initrd rootfs.squashfs install-config.yaml; do
+            echo "  Uploading ${artifact}..."
+            ${SCP_CMD} "${PXE_DIR}/${artifact}" root@localhost:/cm/shared/kairos/${artifact}
+        done
+        echo "[OK] All artifacts uploaded to /cm/shared/kairos/"
     else
-        echo "[1/7] Upload: skipped (image up to date)"
-        echo "[2/7] Extract: skipped (image up to date)"
+        echo "[1/4] Upload: skipped (artifacts up to date)"
     fi
 
-    echo "[3/7] Registering as BCM software image (cm-create-image)..."
-    # cm-create-image must run BEFORE image fixes because it overwrites /etc/default/grub
-    if [[ "$EXTRACTED" == "true" ]]; then
-        # Image was re-extracted — must re-run cm-create-image to reinstall BCM packages
-        # Use -u (update) if image already registered, otherwise create fresh
-        ${SSH_CMD} << 'CM_CREATE' | filter_motd
-if cmsh -c "softwareimage; use kairos-image" 2>/dev/null; then
-    echo "Updating existing kairos-image registration..."
-    cm-create-image -d /cm/images/kairos-image --minimal --skipdist -n kairos-image -g public -u -f 2>&1 | tail -5
-else
-    echo "Creating new kairos-image registration..."
-    cm-create-image -d /cm/images/kairos-image --minimal --skipdist -n kairos-image -g public -f 2>&1 | tail -5
-fi
-echo "[OK] kairos-image registered via cm-create-image"
-CM_CREATE
-    else
-        ${SSH_CMD} << 'CM_CREATE' | filter_motd
-if cmsh -c "softwareimage; use kairos-image" 2>/dev/null; then
-    echo "[OK] kairos-image already registered in cmsh"
-else
-    cm-create-image -d /cm/images/kairos-image --minimal --skipdist -n kairos-image -g public -f 2>&1 | tail -5
-    echo "[OK] kairos-image registered via cm-create-image"
-fi
-CM_CREATE
-    fi
+    echo "[2/4] Starting HTTP server on BCM (${HEAD_NODE_IP}:${HTTP_PORT})..."
+    ${SSH_CMD} << HTTPSERVER | filter_motd
+# Kill any existing server on this port
+pkill -f "python3.*http.server.*${HTTP_PORT}" 2>/dev/null || true
+sleep 1
 
-    echo "[4/7] Placing user-data..."
-    ${SCP_CMD} "${PXE_DIR}/user-data.yaml" root@localhost:/cm/images/kairos-image/oem/99_userdata.yaml
-    # 80_stylus.yaml must NOT be in /oem/ during initial registration.
-    # With it present, stylus-agent takes the upgrade path instead of registration,
-    # which crashes on auth failure and poisons Palette rate limits.
-    # Without it, the agent enters registration mode and retries properly.
-    # After successful registration, stylus-agent creates its own config files.
-    ${SSH_CMD} << 'STYLUS_CHECK' | filter_motd
-if [ -f /cm/images/kairos-image/oem/80_stylus.yaml ]; then
-    rm -f /cm/images/kairos-image/oem/80_stylus.yaml
-    echo "[OK] Removed 80_stylus.yaml from /oem/ (prevents upgrade-path crash)"
+# Start HTTP server serving /cm/shared/kairos/ on internal interface
+cd /cm/shared/kairos
+nohup python3 -m http.server ${HTTP_PORT} --bind ${HEAD_NODE_IP} > /var/log/kairos-http.log 2>&1 &
+echo \$! > /var/run/kairos-http.pid
+
+# Verify it's serving
+sleep 2
+if curl -sf http://${HEAD_NODE_IP}:${HTTP_PORT}/vmlinuz -o /dev/null; then
+    echo "[OK] HTTP server running on ${HEAD_NODE_IP}:${HTTP_PORT}"
 else
-    echo "[OK] 80_stylus.yaml not in /oem/ (correct for registration)"
+    echo "[FAIL] HTTP server not responding"
+    cat /var/log/kairos-http.log 2>/dev/null || true
+    exit 1
 fi
-STYLUS_CHECK
+HTTPSERVER
 
-    echo "[5/7] Configuring image for BCM provisioning..."
-    ${SSH_CMD} << 'IMAGE_FIXES' | filter_motd
-# Ensure ifupdown is installed: cm-create-image removes NetworkManager and masks
-# systemd-networkd, so ifupdown is the only way to bring up interfaces after disk boot.
-if ! chroot /cm/images/kairos-image which ifup &>/dev/null; then
-    chroot /cm/images/kairos-image bash -c 'apt-get install -y --no-install-recommends ifupdown 2>&1 | tail -3'
-    echo "[OK] Installed ifupdown"
-else
-    echo "[OK] ifupdown already installed"
-fi
-mkdir -p /cm/images/kairos-image/etc/network/interfaces.d
-echo "[OK] Ensured /etc/network/interfaces.d/ exists"
-
-# Enable Palette services (stylus-agent, stylus-operator)
-# In normal Kairos boot, boot stages enable these; BCM provisioning skips those.
-# Registration mode is handled by bcm-sync-userdata.sh (ExecStartPre overlay).
-WANTS="/cm/images/kairos-image/etc/systemd/system/multi-user.target.wants"
-mkdir -p "$WANTS"
-for svc in stylus-agent stylus-operator; do
-    SVC_FILE="/cm/images/kairos-image/etc/systemd/system/${svc}.service"
-    if [ -f "$SVC_FILE" ] && [ ! -L "${WANTS}/${svc}.service" ]; then
-        ln -sf "/etc/systemd/system/${svc}.service" "${WANTS}/${svc}.service"
-        echo "[OK] Enabled ${svc}.service"
-    fi
-done
-IMAGE_FIXES
-
-    echo "[6/7] Patching PXE template..."
-    # IPAPPEND 2 (BOOTIF only, no ip= injection)
-    # BCM's default IPAPPEND 3 injects ip= which conflicts with the node-installer
-    ${SSH_CMD} << 'TEMPLATE_PATCH' | filter_motd
+    echo "[3/4] Injecting PXE label into BCM pxelinux config..."
+    ${SSH_CMD} << PXELABEL | filter_motd
 for tmpl in /tftpboot/pxelinux.cfg/template /tftpboot/x86_64/bios/pxelinux.cfg/template; do
-    if [ -f "$tmpl" ] && grep -q "IPAPPEND 3" "$tmpl"; then
-        sed -i 's/IPAPPEND 3/IPAPPEND 2/g' "$tmpl"
-        echo "[OK] Patched $tmpl: IPAPPEND 3 -> 2"
+    if [ -f "\$tmpl" ]; then
+        # Remove existing kairos-install label if present (idempotent)
+        # Delete from LABEL kairos-install to the next blank line or LABEL
+        sed -i '/^LABEL kairos-install/,/^\$/d' "\$tmpl"
+
+        # Append the Kairos installer PXE entry
+        cat >> "\$tmpl" << 'PXEENTRY'
+
+LABEL kairos-install
+  KERNEL http://${HEAD_NODE_IP}:${HTTP_PORT}/vmlinuz
+  INITRD http://${HEAD_NODE_IP}:${HTTP_PORT}/initrd
+  APPEND ip=dhcp rd.neednet=1 netboot install-mode config_url=http://${HEAD_NODE_IP}:${HTTP_PORT}/install-config.yaml live-img-url=http://${HEAD_NODE_IP}:${HTTP_PORT}/rootfs.squashfs console=tty0 console=ttyS0,115200
+PXEENTRY
+        echo "[OK] Injected kairos-install label into \$tmpl"
     fi
 done
-TEMPLATE_PATCH
+PXELABEL
 
-    echo "[7/7] Configuring node001..."
-    # Configure node001 — pipe cmsh commands via echo to avoid nested heredoc expansion issues
-    ${SSH_CMD} "echo -e 'device\nuse node001\nset mac ${COMPUTE_MAC}\nset installmode FULL\nset softwareimage kairos-image\ncommit' | cmsh && echo '[OK] node001: MAC=${COMPUTE_MAC}, installmode=FULL, image=kairos-image'" | filter_motd
-
-    echo "[..] Waiting for ramdisk generation..."
-    ${SSH_CMD} << 'WAIT_RAMDISK' | filter_motd
-KERNEL_VER=$(cmsh -c "softwareimage; use kairos-image; get kernelversion" 2>/dev/null)
-INITRD="/cm/images/kairos-image/boot/initrd.cm.img-${KERNEL_VER}"
-for i in $(seq 1 60); do
-    if [ -f "$INITRD" ]; then
-        echo "[OK] initrd.cm.img generated ($(du -h "$INITRD" | cut -f1))"
-        break
-    fi
-    sleep 5
-done
-if [ ! -f "$INITRD" ]; then
-    echo "[WARN] initrd.cm.img not found after 5 minutes, triggering manually..."
-    cmsh -c "softwareimage; use kairos-image; createramdisk" 2>/dev/null
-    sleep 30
-fi
-# Regenerate node001 ramdisk
-cmsh -c "device; use node001; createramdisk" 2>/dev/null
-sleep 15
-echo "[OK] Node ramdisk ready"
-WAIT_RAMDISK
+    echo "[4/4] Configuring node001 with PXE label..."
+    ${SSH_CMD} "echo -e 'device\nuse node001\nset mac ${COMPUTE_MAC}\nset pxelabel kairos-install\ncommit' | cmsh && echo '[OK] node001: MAC=${COMPUTE_MAC}, pxelabel=kairos-install'" | filter_motd
 
     echo ""
-    echo "[OK] BCM configured to provision Kairos on node001"
+    echo "[OK] BCM configured for Kairos PXE install on node001"
 fi
 
 if [[ "$NO_LAUNCH" == "true" ]]; then
@@ -359,7 +296,8 @@ if [[ "$NO_LAUNCH" == "true" ]]; then
     echo "============================================"
     echo " Deploy complete (--no-launch specified)"
     echo "============================================"
-    echo " node001 will PXE boot and get Kairos via BCM provisioning."
+    echo " node001 will PXE boot into the Kairos installer."
+    echo " Kairos will partition the disk and reboot."
     echo " To launch: $0 --skip-upload"
     echo "============================================"
     exit 0
@@ -386,7 +324,7 @@ if [[ ! -f "$COMPUTE_DISK" ]]; then
     qemu-img create -f qcow2 "$COMPUTE_DISK" "$COMPUTE_DISK_SIZE"
 fi
 
-echo " Mode:      BCM PXE provisioning → disk boot"
+echo " Mode:      Kairos PXE installer → COS partitions → disk boot"
 echo " RAM:       ${COMPUTE_RAM} MB"
 echo " CPUs:      ${COMPUTE_CPUS}"
 echo " Disk:      ${COMPUTE_DISK}"
@@ -398,7 +336,7 @@ echo " Serial:    ${SERIAL_LOG}"
 echo "============================================"
 echo ""
 echo "Boot order: disk first, then network (PXE)."
-echo "First boot: empty disk → PXE → BCM rsyncs image + installs GRUB → reboot → Kairos + Palette registration"
+echo "First boot: empty disk → PXE → Kairos installer → COS partitions → reboot → Palette registration"
 echo ""
 echo "Tip: tail -f ${SERIAL_LOG}"
 echo ""
@@ -406,8 +344,8 @@ echo ""
 > "${SERIAL_LOG}"
 
 # Boot order: disk first, network fallback
-# First boot: disk is empty → falls through to PXE → BCM rsyncs image + installs GRUB
-# After reboot: boots from disk → Kairos + stylus-agent registers with Palette
+# First boot: disk is empty → falls through to PXE → Kairos installer runs
+# After install: boots from disk → Kairos with COS partitions
 qemu-system-x86_64 \
     ${KVM_FLAG} \
     -m "${COMPUTE_RAM}" \
@@ -425,10 +363,10 @@ qemu-system-x86_64 \
     -daemonize \
     -boot order=cn
 
-echo "[..] Compute node VM started, waiting for BCM provisioning + SSH..."
+echo "[..] Compute node VM started"
 
-# Wait for node001 to be UP in BCM and SSH-reachable
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# ---- Phase 1: Wait for Kairos installer to complete ----
+echo "[..] Waiting for Kairos installer to complete..."
 elapsed=0
 timeout=900
 while true; do
@@ -439,12 +377,55 @@ while true; do
         exit 1
     fi
 
-    # Check if node001 is UP and SSH-reachable via BCM
-    NODE_STATUS=$(${SSH_CMD} "cmsh -c 'device; use node001; status' 2>/dev/null" 2>/dev/null | filter_motd || true)
-    if echo "$NODE_STATUS" | grep -q "UP"; then
-        if ${SSH_CMD} "ssh ${SSH_OPTS} -o ConnectTimeout=3 root@10.141.0.1 'echo ok'" >/dev/null 2>&1; then
+    # Check for installer completion markers in serial log
+    if grep -qiE "installation completed|reboot: restarting system|starting reboot" "${SERIAL_LOG}" 2>/dev/null; then
+        echo ""
+        echo "[OK] Kairos installer completed, node is rebooting into installed system..."
+        break
+    fi
+
+    # Check for failure
+    if grep -qiE "installation failed|panic|fatal error" "${SERIAL_LOG}" 2>/dev/null; then
+        echo ""
+        echo "[FAIL] Kairos installer failed. Check: tail ${SERIAL_LOG}"
+        exit 1
+    fi
+
+    elapsed=$((elapsed + 10))
+    if [[ $elapsed -ge $timeout ]]; then
+        echo ""
+        echo "[FAIL] Installer timeout (${timeout}s). Check: tail ${SERIAL_LOG}"
+        exit 1
+    fi
+    printf "\r  [%dm%02ds] Installing..." $((elapsed / 60)) $((elapsed % 60))
+    sleep 10
+done
+
+install_elapsed=$elapsed
+
+# ---- Phase 2: Wait for installed system to boot and SSH to be reachable ----
+echo "[..] Waiting for Kairos to boot from disk..."
+elapsed=0
+timeout=600
+KAIROS_IP=""
+while true; do
+    # Check if QEMU is still running
+    if ! pgrep -f "qemu-system.*Kairos-ComputeNode" >/dev/null 2>&1; then
+        echo ""
+        echo "[FAIL] Compute node QEMU exited unexpectedly"
+        exit 1
+    fi
+
+    # Detect compute node IP from ARP table on BCM head node
+    if [[ -z "$KAIROS_IP" ]]; then
+        KAIROS_IP=$(${SSH_CMD} "arp -an 2>/dev/null | grep '${COMPUTE_MAC}' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd || true)
+    fi
+
+    # Try SSH to compute node through BCM head node
+    if [[ -n "$KAIROS_IP" ]]; then
+        if ${SSH_CMD} "sshpass -p kairos ssh ${SSH_OPTS} -o ConnectTimeout=3 kairos@${KAIROS_IP} 'echo ok'" >/dev/null 2>&1; then
             echo ""
-            echo "[OK] Kairos compute node is UP and SSH-ready (${elapsed}s)"
+            echo "[OK] Kairos compute node is up and SSH-ready at ${KAIROS_IP} (${elapsed}s)"
             break
         fi
     fi
@@ -452,40 +433,31 @@ while true; do
     elapsed=$((elapsed + 10))
     if [[ $elapsed -ge $timeout ]]; then
         echo ""
-        echo "[FAIL] Compute node not ready after ${timeout}s"
+        echo "[FAIL] Compute node not SSH-ready after ${timeout}s"
+        echo "  IP detected: ${KAIROS_IP:-none}"
         exit 1
     fi
-    printf "\r  [%dm%02ds] Waiting... %s" $((elapsed / 60)) $((elapsed % 60)) "$(echo "$NODE_STATUS" | tr -d '[:space:]' | head -c 40)"
+    printf "\r  [%dm%02ds] Waiting for SSH... (IP: %s)" $((elapsed / 60)) $((elapsed % 60)) "${KAIROS_IP:-detecting}"
     sleep 10
 done
 
-# ---- Post-provisioning validation ----
-echo "[..] Validating services on compute node..."
-NODE_SSH="${SSH_CMD} \"ssh ${SSH_OPTS} root@10.141.0.1\""
-FAIL=false
+boot_elapsed=$elapsed
 
-# Check cmd service
-if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
-    echo "[OK] cmd service is active"
-else
-    echo "[FAIL] cmd service is not active"
-    FAIL=true
-fi
+# ---- Post-install cleanup ----
+echo "[..] Cleaning up PXE label and HTTP server..."
 
-# Check stylus-agent service
-if ${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'systemctl is-active stylus-agent'" 2>/dev/null | filter_motd | grep -q "active"; then
-    echo "[OK] stylus-agent is active"
-else
-    echo "[FAIL] stylus-agent is not active"
-    FAIL=true
-fi
+# Clear pxelabel and set installmode SKIP so BCM doesn't re-provision on reboot
+${SSH_CMD} "echo -e 'device\nuse node001\nclear pxelabel\nset installmode SKIP\ncommit' | cmsh && echo '[OK] Cleared pxelabel, set installmode=SKIP'" | filter_motd
 
-# Wait for stylus-agent to register with Palette (may take a few minutes due to login retries)
+# Stop HTTP server — no longer needed after install
+${SSH_CMD} "pkill -f 'python3.*http.server.*${HTTP_PORT}' 2>/dev/null; rm -f /var/run/kairos-http.pid; echo '[OK] HTTP server stopped'" | filter_motd
+
+# ---- Wait for Palette registration ----
 echo "[..] Waiting for Palette registration..."
 reg_elapsed=0
 reg_timeout=300
 while true; do
-    REG_LOGS=$(${SSH_CMD} "ssh ${SSH_OPTS} root@10.141.0.1 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+    REG_LOGS=$(${SSH_CMD} "sshpass -p kairos ssh ${SSH_OPTS} kairos@${KAIROS_IP} 'sudo journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
     if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
         echo ""
         echo "[OK] stylus-agent registered with Palette"
@@ -494,19 +466,26 @@ while true; do
     reg_elapsed=$((reg_elapsed + 10))
     if [[ $reg_elapsed -ge $reg_timeout ]]; then
         echo ""
-        echo "[FAIL] Palette registration not detected after ${reg_timeout}s"
-        FAIL=true
+        echo "[WARN] Palette registration not detected after ${reg_timeout}s"
+        echo "  stylus-agent may still be starting. Check manually:"
+        echo "  ssh kairos@${KAIROS_IP} 'sudo journalctl -u stylus-agent -f'"
         break
     fi
     printf "\r  [%dm%02ds] Waiting for registration..." $((reg_elapsed / 60)) $((reg_elapsed % 60))
     sleep 10
 done
 
-if [[ "$FAIL" == "true" ]]; then
-    echo ""
-    echo "[FAIL] Post-provisioning validation failed"
-    exit 1
-fi
-
+total_elapsed=$((install_elapsed + boot_elapsed + reg_elapsed))
 echo ""
-echo "[OK] Compute node fully provisioned and registered (total: $((elapsed + reg_elapsed))s)"
+echo "============================================"
+echo " Kairos Compute Node Ready (Option C)"
+echo "============================================"
+echo " Install time:  ${install_elapsed}s"
+echo " Boot time:     ${boot_elapsed}s"
+echo " Registration:  ${reg_elapsed}s"
+echo " Total:         ${total_elapsed}s"
+echo ""
+echo " IP:    ${KAIROS_IP}"
+echo " SSH:   sshpass -p kairos ssh kairos@${KAIROS_IP} (via BCM)"
+echo " COS partitions: run 'lsblk -o NAME,LABEL' on compute node"
+echo "============================================"

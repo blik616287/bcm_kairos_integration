@@ -183,7 +183,7 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 			"grep -oP '(?<=lease )10\\.141\\.[0-9]+\\.[0-9]+' /var/lib/dhcpd/dhcpd.leases 2>/dev/null | tail -1" 2>/dev/null); \
 		if [ -n "$$KAIROS_IP" ]; then \
 			if sshpass -p "$(BCM_PASSWORD)" ssh $(SSH_OPTS) -p 10022 root@localhost \
-				"sshpass -p kairos ssh $(SSH_OPTS) -o ConnectTimeout=3 kairos@$$KAIROS_IP 'echo ok'" >/dev/null 2>&1; then \
+				"sshpass -p 'kairos' ssh $(SSH_OPTS) -o ConnectTimeout=3 kairos@$$KAIROS_IP 'echo ok'" >/dev/null 2>&1; then \
 				echo ""; \
 				echo "[OK] Kairos node reachable at $$KAIROS_IP ($$elapsed seconds)"; \
 				break; \
@@ -201,15 +201,15 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 # ---- Kairos Deploy & Test ----
 
 .PHONY: kairos-deploy
-kairos-deploy: _require-bcm-password _require-bcm-running ## Deploy Kairos as BCM software image (upload + configure)
+kairos-deploy: _require-bcm-password _require-palette _require-bcm-running ## Deploy Kairos boot artifacts for PXE install (Option C)
 	src/test-kairos-pxe.sh --no-launch
 
 .PHONY: kairos-run
-kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node, wait for BCM provisioning + SSH ready
+kairos-run: _require-bcm-password _require-bcm-running ## Launch compute node, Kairos installer partitions disk + reboots
 	src/test-kairos-pxe.sh --skip-upload --reset-compute
 
 .PHONY: kairos-stop
-kairos-stop: ## Kill running Kairos compute node VM
+kairos-stop: ## Kill running Kairos compute node VM and HTTP server on BCM
 	@if [ -f build/.kairos-qemu.pid ] && kill $$(cat build/.kairos-qemu.pid) 2>/dev/null; then \
 		rm -f build/.kairos-qemu.pid; \
 		echo "Kairos VM stopped."; \
@@ -217,6 +217,8 @@ kairos-stop: ## Kill running Kairos compute node VM
 		rm -f build/.kairos-qemu.pid; \
 		echo "No Kairos VM running."; \
 	fi
+	@sshpass -p "$(BCM_PASSWORD)" ssh $(SSH_OPTS) -p 10022 root@localhost \
+		"pkill -f 'python3.*http.server.*8080' 2>/dev/null; rm -f /var/run/kairos-http.pid" 2>/dev/null || true
 
 .PHONY: kairos-validate
 kairos-validate: _require-bcm-password _require-bcm-running ## Validate Kairos node through BCM head node

@@ -182,7 +182,7 @@ can_skip() {
             [[ -f "build/palette-edge-installer.iso" ]]
             ;;
         kairos-extract)
-            [[ -d "build/pxe" ]] && [[ -f "build/pxe/rootfs.squashfs" ]] && [[ -f "build/pxe/vmlinuz" ]] && [[ -f "build/pxe/user-data.yaml" ]]
+            [[ -d "build/pxe" ]] && [[ -f "build/pxe/rootfs.squashfs" ]] && [[ -f "build/pxe/vmlinuz" ]] && [[ -f "build/pxe/initrd" ]] && [[ -f "build/pxe/install-config.yaml" ]]
             ;;
         kairos-run)
             # Skip if VM is already running and SSH-reachable via BCM

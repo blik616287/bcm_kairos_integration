@@ -1,12 +1,14 @@
 #!/bin/bash
 # extract-kairos-pxe.sh
 #
-# Extracts artifacts from a CanvOS-built Kairos ISO for BCM provisioning:
-#   - rootfs.squashfs (to be unsquashed as a BCM software image)
-#   - user-data.yaml (Palette registration + SSH config for /oem/)
+# Extracts artifacts from a CanvOS-built Kairos ISO for Option C deployment:
+#   - vmlinuz           (kernel for PXE boot)
+#   - initrd            (initramfs for PXE boot)
+#   - rootfs.squashfs   (root filesystem, served via HTTP)
+#   - install-config.yaml (cloud-config with install: block for Kairos auto-install)
 #
-# BCM handles PXE boot, disk provisioning (rsync), and GRUB installation.
-# No kernel/initrd/iPXE/dracut hooks needed — BCM's node-installer does all of that.
+# Option C: BCM provides DHCP + PXE label pointing to Kairos kernel/initrd.
+# Kairos handles its own disk partitioning (COS_OEM, COS_STATE, COS_RECOVERY, COS_PERSISTENT).
 #
 # Usage:
 #   ./extract-kairos-pxe.sh [OPTIONS]
@@ -26,14 +28,13 @@ PALETTE_TOKEN="${PALETTE_TOKEN:?ERROR: PALETTE_TOKEN not set. Set in env.json or
 PALETTE_PROJECT_UID="${PALETTE_PROJECT_UID:?ERROR: PALETTE_PROJECT_UID not set. Set in env.json or export PALETTE_PROJECT_UID}"
 
 # Edge host name — used as both the Palette edge ID and system hostname.
-# Keeps BCM and Palette in sync (BCM knows this node by the same name).
 EDGE_HOST_NAME="${EDGE_HOST_NAME:-node001}"
 
 usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
 
-Extracts artifacts from a Kairos ISO for BCM provisioning.
+Extracts boot artifacts from a Kairos ISO for Option C PXE deployment.
 
 Options:
   --iso PATH           Path to Kairos ISO (default: build/palette-edge-installer.iso)
@@ -43,8 +44,10 @@ Options:
   -h, --help           Show this help
 
 Outputs:
-  build/pxe/rootfs.squashfs   Root filesystem (unsquashed as BCM image)
-  build/pxe/user-data.yaml    Cloud-config for Palette registration
+  build/pxe/vmlinuz             Kernel for PXE boot
+  build/pxe/initrd              Initramfs for PXE boot
+  build/pxe/rootfs.squashfs     Root filesystem (served via HTTP)
+  build/pxe/install-config.yaml Cloud-config for Kairos auto-install
 EOF
     exit 0
 }
@@ -83,16 +86,61 @@ cleanup() {
 trap cleanup EXIT
 
 echo "============================================"
-echo " Extracting Kairos Artifacts for BCM"
+echo " Extracting Kairos Artifacts (Option C)"
 echo "============================================"
 echo " ISO:    $ISO_PATH"
 echo " Output: $OUTPUT_DIR"
 echo "============================================"
 echo ""
 
-echo "[1/3] Mounting ISO and extracting rootfs.squashfs..."
+echo "[1/4] Mounting ISO and extracting boot artifacts..."
 sudo mount -o loop,ro "$ISO_PATH" "$MOUNT_DIR"
 
+# Extract kernel (may be named vmlinuz, kernel, or vmlinuz-*)
+VMLINUZ=""
+for candidate in "${MOUNT_DIR}/boot/vmlinuz" "${MOUNT_DIR}/vmlinuz" "${MOUNT_DIR}/boot/kernel" "${MOUNT_DIR}/kernel" "${MOUNT_DIR}/boot/vmlinuz-"*; do
+    if [[ -f "$candidate" ]]; then
+        VMLINUZ="$candidate"
+        break
+    fi
+done
+if [[ -z "$VMLINUZ" ]]; then
+    VMLINUZ=$(find "${MOUNT_DIR}" \( -name "vmlinuz*" -o -name "kernel" \) -type f -print -quit 2>/dev/null || true)
+fi
+if [[ -z "$VMLINUZ" || ! -f "$VMLINUZ" ]]; then
+    echo "ERROR: No kernel (vmlinuz) found in ISO"
+    echo "ISO contents:"
+    ls -la "${MOUNT_DIR}/" 2>/dev/null
+    ls -la "${MOUNT_DIR}/boot/" 2>/dev/null || true
+    exit 1
+fi
+sudo cp "$VMLINUZ" "${OUTPUT_DIR}/vmlinuz"
+sudo chmod 644 "${OUTPUT_DIR}/vmlinuz"
+echo "  Found kernel: ${VMLINUZ#$MOUNT_DIR}"
+
+# Extract initrd (may be named initrd, initrd.img, initramfs-*)
+INITRD=""
+for candidate in "${MOUNT_DIR}/boot/initrd" "${MOUNT_DIR}/initrd" "${MOUNT_DIR}/boot/initrd.img" "${MOUNT_DIR}/boot/initramfs-"*; do
+    if [[ -f "$candidate" ]]; then
+        INITRD="$candidate"
+        break
+    fi
+done
+if [[ -z "$INITRD" ]]; then
+    INITRD=$(find "${MOUNT_DIR}" -name "initrd*" -o -name "initramfs*" -type f 2>/dev/null | head -1 || true)
+fi
+if [[ -z "$INITRD" || ! -f "$INITRD" ]]; then
+    echo "ERROR: No initrd found in ISO"
+    echo "ISO contents:"
+    ls -la "${MOUNT_DIR}/" 2>/dev/null
+    ls -la "${MOUNT_DIR}/boot/" 2>/dev/null || true
+    exit 1
+fi
+sudo cp "$INITRD" "${OUTPUT_DIR}/initrd"
+sudo chmod 644 "${OUTPUT_DIR}/initrd"
+echo "  Found initrd: ${INITRD#$MOUNT_DIR}"
+
+# Extract squashfs
 if [[ -f "${MOUNT_DIR}/rootfs.squashfs" ]]; then
     sudo cp "${MOUNT_DIR}/rootfs.squashfs" "${OUTPUT_DIR}/rootfs.squashfs"
 else
@@ -107,16 +155,27 @@ else
     fi
 fi
 sudo chmod 644 "${OUTPUT_DIR}/rootfs.squashfs"
+
 sudo umount "$MOUNT_DIR"
 
-# ---- Generate user-data ----
-# This goes into /oem/99_userdata.yaml in the BCM image.
-# BCM rsyncs the entire image to the compute node's disk, so this
-# is already on disk when Kairos boots — no live boot or config_url needed.
-echo "[2/3] Generating user-data.yaml..."
+# ---- Generate install cloud-config ----
+# This drives the Kairos installer (auto-install mode) and carries over
+# to the installed system. Unlike Option A's user-data.yaml (placed in /oem/
+# by BCM rsync), this is fetched via config_url during PXE boot.
+echo "[2/4] Generating install-config.yaml..."
 
-cat > "${OUTPUT_DIR}/user-data.yaml" <<USERDATA
+cat > "${OUTPUT_DIR}/install-config.yaml" <<INSTALLCONFIG
 #cloud-config
+
+# Kairos auto-install: partitions disk with COS layout, reboots into installed system
+install:
+  auto: true
+  device: "auto"
+  reboot: true
+  poweroff: false
+  partitions:
+    persistent:
+      size: 0
 
 # Palette Edge Registration
 stylus:
@@ -151,21 +210,26 @@ stages:
           permissions: 0644
       commands:
         - systemctl restart sshd || systemctl restart ssh || true
-USERDATA
+INSTALLCONFIG
 
 # ---- Summary ----
-echo "[3/3] Generating checksums..."
+echo "[3/4] Generating checksums..."
 cd "$OUTPUT_DIR"
-sha256sum rootfs.squashfs user-data.yaml > SHA256SUMS
+sha256sum vmlinuz initrd rootfs.squashfs install-config.yaml > SHA256SUMS
 
+VMLINUZ_SIZE=$(du -h "${OUTPUT_DIR}/vmlinuz" | cut -f1)
+INITRD_SIZE=$(du -h "${OUTPUT_DIR}/initrd" | cut -f1)
 SQFS_SIZE=$(du -h "${OUTPUT_DIR}/rootfs.squashfs" | cut -f1)
 
+echo "[4/4] Done."
 echo ""
 echo "============================================"
 echo " Extraction complete!"
 echo "============================================"
-echo " ${OUTPUT_DIR}/rootfs.squashfs  (${SQFS_SIZE})"
-echo " ${OUTPUT_DIR}/user-data.yaml"
+echo " ${OUTPUT_DIR}/vmlinuz             (${VMLINUZ_SIZE})"
+echo " ${OUTPUT_DIR}/initrd              (${INITRD_SIZE})"
+echo " ${OUTPUT_DIR}/rootfs.squashfs     (${SQFS_SIZE})"
+echo " ${OUTPUT_DIR}/install-config.yaml"
 echo " ${OUTPUT_DIR}/SHA256SUMS"
 echo ""
 echo " Next: make kairos-deploy"
