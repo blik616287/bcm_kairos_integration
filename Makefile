@@ -32,15 +32,21 @@ PALETTE_ENDPOINT  := $(or $(call jq,.palette_endpoint),api.spectrocloud.com)
 JFROG_INSTANCE    := $(or $(call jq,.jfrog_instance),insightsoftmax.jfrog.io)
 JFROG_REPO        := $(or $(call jq,.jfrog_repo),iso-releases)
 ISO_FILENAME      := $(or $(call jq,.iso_filename),bcm-11.0-ubuntu2404.iso)
+DEPLOY_METHOD     := $(or $(call jq,.deploy_method),option-a)
+KAIROS_KERNEL_VER := $(or $(call jq,.kairos_kernel_version),6.8.0-87-generic)
+KAIROS_REGISTRY   := $(or $(call jq,.kairos_container_registry),ttl.sh)
 
 # Derived paths
 ISO_PATH          := dist/$(ISO_FILENAME)
 
 # Export common env vars for scripts
 PALETTE_PROJECT_UID := $(PALETTE_PROJECT)
+KAIROS_KERNEL_VERSION := $(KAIROS_KERNEL_VER)
+KAIROS_CONTAINER_REGISTRY := $(KAIROS_REGISTRY)
 export BCM_PASSWORD BCM_HOSTNAME BCM_TIMEZONE
 export PALETTE_ENDPOINT PALETTE_TOKEN PALETTE_PROJECT_UID
-export ISO_PATH
+export ISO_PATH DEPLOY_METHOD
+export KAIROS_KERNEL_VERSION KAIROS_CONTAINER_REGISTRY
 
 # SSH options (reused across targets)
 SSH_OPTS := -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
@@ -198,6 +204,28 @@ kairos-wait: _require-bcm-password _require-bcm-running ## Wait for Kairos compu
 		sleep 10; \
 	done
 
+# ---- Kairos Option B: Raw Disk Image via dd ----
+
+.PHONY: kairos-container
+kairos-container: ## Build Kairos container image (Option B: Ubuntu 24.04 + BCM kernel)
+	src/build-kairos-container.sh
+
+.PHONY: kairos-raw
+kairos-raw: _require-palette ## Generate raw disk image via AuroraBoot (Option B)
+	src/generate-raw-image.sh
+
+.PHONY: kairos-deploy-dd
+kairos-deploy-dd: _require-bcm-password _require-bcm-running ## Deploy Kairos via dd installer (Option B: upload + configure)
+	src/deploy-kairos-dd.sh --no-launch
+
+.PHONY: kairos-run-dd
+kairos-run-dd: _require-bcm-password _require-bcm-running ## Launch compute node with dd installer (Option B)
+	src/deploy-kairos-dd.sh --skip-upload --reset-compute
+
+.PHONY: kairos-validate-cos
+kairos-validate-cos: _require-bcm-password _require-bcm-running ## Validate COS partitions + immutability (Option B)
+	src/validate-kairos.sh --cos-checks
+
 # ---- Kairos Deploy & Test ----
 
 .PHONY: kairos-deploy
@@ -252,8 +280,9 @@ clean-bcm: ## Remove BCM auto-install artifacts (build/.bcm-*)
 	rm -f build/.bcm-kernel build/.bcm-rootfs-auto.cgz build/.bcm-init.img
 
 .PHONY: clean-kairos
-clean-kairos: ## Remove PXE artifacts only (build/pxe/)
-	rm -rf build/pxe/
+clean-kairos: ## Remove Kairos artifacts (PXE + Option B)
+	rm -rf build/pxe/ build/kairos-container/ build/auroraboot/
+	rm -f build/kairos-container-image.ref build/kairos-disk.raw build/kairos-disk.raw.sha256
 
 .PHONY: clean-disks
 clean-disks: ## Remove all QEMU disk images

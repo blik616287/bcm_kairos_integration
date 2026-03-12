@@ -23,6 +23,7 @@ BCM_PASSWORD="${BCM_PASSWORD:?ERROR: BCM_PASSWORD not set. Set in env.json or ex
 KAIROS_USER="kairos"
 KAIROS_PASSWORD="kairos"
 KAIROS_IP=""
+COS_CHECKS=false
 
 usage() {
     cat <<EOF
@@ -36,6 +37,7 @@ Options:
   --kairos-ip IP       Kairos node IP (default: auto-detect from DHCP leases)
   --kairos-user USER   Kairos SSH user (default: kairos)
   --kairos-pass PASS   Kairos SSH password (default: kairos)
+  --cos-checks         Run COS partition + immutability checks (Option B)
   -h, --help           Show this help
 EOF
     exit 0
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --kairos-ip)    KAIROS_IP="$2"; shift 2 ;;
         --kairos-user)  KAIROS_USER="$2"; shift 2 ;;
         --kairos-pass)  KAIROS_PASSWORD="$2"; shift 2 ;;
+        --cos-checks)   COS_CHECKS=true; shift ;;
         -h|--help)      usage ;;
         *)              echo "Unknown option: $1"; usage ;;
     esac
@@ -181,6 +184,20 @@ echo \"===USERS===\"
 grep kairos /etc/passwd 2>/dev/null || echo MISSING
 echo \"===ISSUE===\"
 cat /etc/issue 2>/dev/null || echo MISSING
+echo \"===COS_PARTITIONS===\"
+lsblk -o NAME,LABEL,FSTYPE,SIZE,MOUNTPOINT 2>/dev/null || echo MISSING
+echo \"===COS_OEM===\"
+blkid -L COS_OEM 2>/dev/null || echo MISSING
+echo \"===COS_STATE===\"
+blkid -L COS_STATE 2>/dev/null || echo MISSING
+echo \"===COS_RECOVERY===\"
+blkid -L COS_RECOVERY 2>/dev/null || echo MISSING
+echo \"===COS_PERSISTENT===\"
+blkid -L COS_PERSISTENT 2>/dev/null || echo MISSING
+echo \"===ROOT_MOUNT===\"
+mount | grep \" / \" | head -1 || echo MISSING
+echo \"===COS_LAYOUT===\"
+cat /run/cos/cos-layout.env 2>/dev/null || echo MISSING
 echo \"===END===\"
 '" 2>/dev/null | filter_motd)
 
@@ -286,6 +303,59 @@ if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
     check "Palette registration" "PASS" "registered with Palette"
 else
     check "Palette registration" "WARN" "registration not detected"
+fi
+
+# ---- COS Partition Checks (Option B) ----
+# Auto-detect: if COS_OEM exists, enable COS checks automatically
+COS_OEM_DEV=$(get_section "COS_OEM")
+if [[ "$COS_CHECKS" == "true" ]] || [[ "$COS_OEM_DEV" != "MISSING" && -n "$COS_OEM_DEV" ]]; then
+    echo ""
+    echo "-- COS Partitions (Option B) --"
+
+    if [[ "$COS_OEM_DEV" != "MISSING" && -n "$COS_OEM_DEV" ]]; then
+        check "COS_OEM partition" "PASS" "$COS_OEM_DEV"
+    else
+        check "COS_OEM partition" "FAIL" "not found"
+    fi
+
+    COS_RECOVERY_DEV=$(get_section "COS_RECOVERY")
+    if [[ "$COS_RECOVERY_DEV" != "MISSING" && -n "$COS_RECOVERY_DEV" ]]; then
+        check "COS_RECOVERY partition" "PASS" "$COS_RECOVERY_DEV"
+    else
+        check "COS_RECOVERY partition" "FAIL" "not found"
+    fi
+
+    COS_STATE_DEV=$(get_section "COS_STATE")
+    if [[ "$COS_STATE_DEV" != "MISSING" && -n "$COS_STATE_DEV" ]]; then
+        check "COS_STATE partition" "PASS" "$COS_STATE_DEV"
+    else
+        check "COS_STATE partition" "WARN" "not found (created on first Kairos boot)"
+    fi
+
+    COS_PERSISTENT_DEV=$(get_section "COS_PERSISTENT")
+    if [[ "$COS_PERSISTENT_DEV" != "MISSING" && -n "$COS_PERSISTENT_DEV" ]]; then
+        check "COS_PERSISTENT partition" "PASS" "$COS_PERSISTENT_DEV"
+    else
+        check "COS_PERSISTENT partition" "WARN" "not found (created on first Kairos boot)"
+    fi
+
+    # Check root filesystem immutability
+    ROOT_MOUNT=$(get_section "ROOT_MOUNT")
+    if echo "$ROOT_MOUNT" | grep -q "ro,\|ro "; then
+        check "Root filesystem immutable" "PASS" "mounted read-only"
+    elif [[ -n "$ROOT_MOUNT" && "$ROOT_MOUNT" != "MISSING" ]]; then
+        check "Root filesystem immutable" "WARN" "mounted read-write: $ROOT_MOUNT"
+    else
+        check "Root filesystem immutable" "WARN" "could not determine mount mode"
+    fi
+
+    # Check cos-layout.env
+    COS_LAYOUT=$(get_section "COS_LAYOUT")
+    if [[ "$COS_LAYOUT" != "MISSING" && -n "$COS_LAYOUT" ]]; then
+        check "COS layout config" "PASS" "cos-layout.env present"
+    else
+        check "COS layout config" "WARN" "/run/cos/cos-layout.env missing"
+    fi
 fi
 
 # ---- Summary ----

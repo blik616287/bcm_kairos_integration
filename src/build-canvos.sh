@@ -163,12 +163,29 @@ cp "${ISO_FILE}" "${BUILD_DIR}/"
 
 ISO_SIZE=$(du -h "${BUILD_DIR}/${ISO_NAME}.iso" | cut -f1)
 
+# ---- Write container image ref (for Option B raw image generation) ----
+# CanvOS pushes the provider image as $IMAGE_REGISTRY/$IMAGE_REPO:$K8S_DIST-$K8S_VERSION-$IMAGE_TAG
+# Detect the most recent CanvOS image from docker
+CANVOS_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+    | grep "^${IMAGE_REGISTRY}/${OS_DISTRIBUTION}:" \
+    | grep "${CUSTOM_TAG}" \
+    | head -1)
+
+if [[ -n "$CANVOS_IMAGE" ]]; then
+    echo "${CANVOS_IMAGE}" > "${BUILD_DIR}/kairos-container-image.ref"
+    echo " Container: ${CANVOS_IMAGE} (saved to kairos-container-image.ref)"
+else
+    echo " [WARN] Could not detect CanvOS container image for Option B"
+fi
+
 echo ""
 echo "============================================"
 echo " Build complete!"
 echo "============================================"
 echo " ${BUILD_DIR}/${ISO_NAME}.iso (${ISO_SIZE})"
 [[ -f "${BUILD_DIR}/${ISO_NAME}.iso.sha256" ]] && echo " ${BUILD_DIR}/${ISO_NAME}.iso.sha256"
+[[ -n "${CANVOS_IMAGE:-}" ]] && echo " Container: ${CANVOS_IMAGE} (for Option B)"
 echo ""
-echo " Next: ./extract-kairos-pxe.sh"
+echo " Next (Option A): ./extract-kairos-pxe.sh"
+echo " Next (Option B): ./generate-raw-image.sh"
 echo "============================================"
