@@ -31,6 +31,11 @@ PALETTE_TOKEN="${PALETTE_TOKEN:?ERROR: PALETTE_TOKEN not set. Set in env.json or
 PALETTE_PROJECT_UID="${PALETTE_PROJECT_UID:?ERROR: PALETTE_PROJECT_UID not set. Set in env.json or export PALETTE_PROJECT_UID}"
 EDGE_HOST_NAME="${EDGE_HOST_NAME:-node001}"
 
+# BCM integration
+BCM_PASSWORD="${BCM_PASSWORD:-}"
+HEAD_NODE_IP="${HEAD_NODE_IP:-10.141.255.254}"
+BCM_SSH_KEY="${BCM_SSH_KEY:-}"  # Path to private key for SSH to BCM head node
+
 # AuroraBoot config
 AURORABOOT_IMAGE="quay.io/kairos/auroraboot"
 DISK_SIZE="${DISK_SIZE:-81920}"  # MB
@@ -108,6 +113,88 @@ echo ""
 # ---- Generate cloud-config ----
 echo "[1/3] Generating cloud-config..."
 
+# Read BCM SSH private key if provided
+BCM_SSH_KEY_CONTENT=""
+if [[ -n "$BCM_SSH_KEY" && -f "$BCM_SSH_KEY" ]]; then
+    BCM_SSH_KEY_CONTENT=$(cat "$BCM_SSH_KEY")
+    echo "  BCM SSH key: ${BCM_SSH_KEY}"
+elif [[ -f "${BUILD_DIR}/bcm-kairos-key" ]]; then
+    BCM_SSH_KEY_CONTENT=$(cat "${BUILD_DIR}/bcm-kairos-key")
+    echo "  BCM SSH key: ${BUILD_DIR}/bcm-kairos-key"
+fi
+
+# Build the BCM integration stages block if we have credentials
+BCM_STAGES=""
+if [[ -n "$BCM_SSH_KEY_CONTENT" ]]; then
+    # Indent the key content for YAML embedding (10 spaces for file content block)
+    INDENTED_KEY=$(echo "$BCM_SSH_KEY_CONTENT" | sed 's/^/              /')
+
+    BCM_STAGES=$(cat <<BCMEOF
+    - name: "Install BCM SSH key"
+      files:
+        - path: /var/lib/bcm/bcm-key
+          content: |
+${INDENTED_KEY}
+          permissions: 0600
+          owner: 0
+          group: 0
+    - name: "BCM integration: set NOSYNC + start cmd chroot"
+      commands:
+        - |
+          # Wait for network to be ready
+          for i in \$(seq 1 30); do
+            ping -c1 -W2 ${HEAD_NODE_IP} >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          # Set installmode NOSYNC on BCM head node to prevent re-provisioning
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@${HEAD_NODE_IP} \
+              "echo -e 'device\nuse ${EDGE_HOST_NAME}\nset installmode NOSYNC\ncommit' | cmsh" \
+              >/dev/null 2>&1 && echo "bcm-init: NOSYNC set" || echo "bcm-init: NOSYNC failed"
+
+          # NFS mount BCM default-image rootfs for cmd chroot
+          mkdir -p /var/lib/cm/rootfs
+          mount -t nfs -o ro,nolock,vers=3 ${HEAD_NODE_IP}:/cm/images/default-image /var/lib/cm/rootfs 2>/dev/null || {
+            echo "bcm-init: NFS mount failed"; exit 0
+          }
+
+          # Mount /cm/shared (writable)
+          mount -t nfs -o rw,nolock,vers=3 ${HEAD_NODE_IP}:/cm/shared /var/lib/cm/rootfs/cm/shared 2>/dev/null || true
+
+          # Mount essentials for chroot
+          mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
+          mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
+          mount --bind /dev /var/lib/cm/rootfs/dev 2>/dev/null || true
+
+          # Writable tmpfs for cmd runtime state (NFS rootfs is read-only)
+          mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/spool/cmd 2>/dev/null || true
+          mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/run 2>/dev/null || true
+          mount -t tmpfs tmpfs /var/lib/cm/rootfs/tmp 2>/dev/null || true
+
+          # Writable overlay for cmd config (need to set Master IP)
+          mkdir -p /var/lib/cm/cmd-etc
+          cp /var/lib/cm/rootfs/cm/local/apps/cmd/etc/* /var/lib/cm/cmd-etc/ 2>/dev/null || true
+          mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
+          sed -i "s/Master = master/Master = ${HEAD_NODE_IP}/" /var/lib/cm/cmd-etc/cmd.conf
+
+          # Copy network info into chroot
+          cp /etc/resolv.conf /var/lib/cm/rootfs/etc/resolv.conf 2>/dev/null || true
+          echo "${EDGE_HOST_NAME}" > /var/lib/cm/rootfs/etc/hostname 2>/dev/null || true
+
+          # Start cmd daemon in slave mode inside chroot (background)
+          chroot /var/lib/cm/rootfs /bin/bash -c '
+            export HOSTNAME=${EDGE_HOST_NAME}
+            mkdir -p /var/spool/cmd /var/run
+            /cm/local/apps/cmd/sbin/cmd -s -n &
+          ' >/dev/null 2>&1 &
+
+          echo "bcm-init: cmd chroot started"
+BCMEOF
+    )
+fi
+
 cat > "${AURORABOOT_DIR}/cloud-config.yaml" <<CLOUDCONFIG
 #cloud-config
 
@@ -145,6 +232,7 @@ stages:
           permissions: 0644
       commands:
         - systemctl restart sshd || systemctl restart ssh || true
+${BCM_STAGES}
 CLOUDCONFIG
 
 # ---- Run AuroraBoot ----

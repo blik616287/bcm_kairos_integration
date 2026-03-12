@@ -199,6 +199,22 @@ echo "[OK] BCM services ready (cmd active, cmsh responsive)"
 # Ensure sshpass is available on BCM (needed for Phase 2 Kairos SSH detection)
 ${SSH_CMD} "command -v sshpass >/dev/null 2>&1 || apt-get install -y -qq sshpass >/dev/null 2>&1" 2>/dev/null || true
 
+# ---- Generate SSH key pair for Kairos → BCM communication ----
+BCM_KEY="${BUILD_DIR}/bcm-kairos-key"
+BCM_KEY_PUB="${BCM_KEY}.pub"
+if [[ ! -f "$BCM_KEY" ]]; then
+    echo "[..] Generating SSH key pair for Kairos → BCM..."
+    ssh-keygen -t ed25519 -f "$BCM_KEY" -N "" -C "kairos-node@bcm" -q
+fi
+# Add public key to BCM authorized_keys (idempotent)
+PUBKEY=$(cat "$BCM_KEY_PUB")
+${SSH_CMD} "grep -qF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || echo '${PUBKEY}' >> /root/.ssh/authorized_keys" 2>/dev/null || true
+echo "[OK] SSH key pair ready (Kairos can SSH to BCM)"
+
+# ---- Export BCM default-image via NFS for cmd chroot ----
+${SSH_CMD} "exportfs -v 2>/dev/null | grep -q '/cm/images/default-image' || exportfs -o ro,no_subtree_check,no_root_squash,async 10.141.0.0/16:/cm/images/default-image" 2>/dev/null || true
+echo "[OK] /cm/images/default-image exported via NFS"
+
 # ---- Deploy Kairos raw image + installer ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
     echo ""
