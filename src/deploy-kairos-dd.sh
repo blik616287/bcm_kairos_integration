@@ -211,9 +211,10 @@ PUBKEY=$(cat "$BCM_KEY_PUB")
 ${SSH_CMD} "grep -qF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || echo '${PUBKEY}' >> /root/.ssh/authorized_keys" 2>/dev/null || true
 echo "[OK] SSH key pair ready (Kairos can SSH to BCM)"
 
-# ---- Export BCM default-image via NFS for cmd chroot ----
+# ---- Export BCM paths via NFS for cmd podman container ----
 ${SSH_CMD} "exportfs -v 2>/dev/null | grep -q '/cm/images/default-image' || exportfs -o ro,no_subtree_check,no_root_squash,async 10.141.0.0/16:/cm/images/default-image" 2>/dev/null || true
-echo "[OK] /cm/images/default-image exported via NFS"
+${SSH_CMD} "exportfs -v 2>/dev/null | grep -q '/cm/shared' || exportfs -o rw,no_subtree_check,no_root_squash,async 10.141.0.0/16:/cm/shared" 2>/dev/null || true
+echo "[OK] BCM NFS exports configured (default-image, /cm/shared)"
 
 # ---- Deploy Kairos raw image + installer ----
 if [[ "$SKIP_UPLOAD" != "true" ]]; then
@@ -365,7 +366,10 @@ echo "[\$(date)] ============================================"
 echo "[\$(date)] Write complete. Rebooting into Kairos..."
 echo "[\$(date)] ============================================"
 /dev/shm/kinstall/sleep 2
-/dev/shm/kinstall/reboot -f
+# Use sysrq trigger for hard reboot — reboot -f may fail when filesystem is destroyed
+echo s > /proc/sysrq-trigger 2>/dev/null || true
+/dev/shm/kinstall/sleep 1
+echo b > /proc/sysrq-trigger
 DDEOF
 chmod +x "$RAMDIR/run-dd.sh"
 

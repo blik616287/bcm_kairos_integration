@@ -132,11 +132,18 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 
     # Patch Earthfile to add BCM-required packages
     # wget: BCM's wait_cmd uses it to health-check the cmd daemon
-    # initramfs-tools: BCM needs it to generate node ramdisks
     # ifupdown: BCM removes NetworkManager and masks systemd-networkd; needs ifupdown for networking
+    # nfs-common: NFS client for mounting BCM default-image rootfs
     if ! grep -q 'wget' "${CANVOS_DIR}/Earthfile"; then
-        echo "Patching Earthfile: adding wget, initramfs-tools, ifupdown..."
-        sed -i 's/apt-get install --no-install-recommends kbd/apt-get install --no-install-recommends wget initramfs-tools ifupdown kbd/' \
+        echo "Patching Earthfile: adding wget, ifupdown, nfs-common..."
+        sed -i 's/apt-get install --no-install-recommends kbd/apt-get install --no-install-recommends wget ifupdown nfs-common kbd/' \
+            "${CANVOS_DIR}/Earthfile"
+    fi
+
+    # Skip dracut nfit module (libnvdimm not available for all kernels)
+    if ! grep -q 'skip-nfit' "${CANVOS_DIR}/Earthfile"; then
+        echo "Patching Earthfile: skipping dracut nfit module..."
+        sed -i '/IF \[ "\$FIPS_ENABLED" = "false" \]/a\                RUN echo '"'"'omit_dracutmodules+=" nfit "'"'"' > /etc/dracut.conf.d/99-skip-nfit.conf' \
             "${CANVOS_DIR}/Earthfile"
     fi
 
@@ -169,7 +176,7 @@ ISO_SIZE=$(du -h "${BUILD_DIR}/${ISO_NAME}.iso" | cut -f1)
 CANVOS_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
     | grep "^${IMAGE_REGISTRY}/${OS_DISTRIBUTION}:" \
     | grep "${CUSTOM_TAG}" \
-    | head -1)
+    | head -1 || true)
 
 if [[ -n "$CANVOS_IMAGE" ]]; then
     echo "${CANVOS_IMAGE}" > "${BUILD_DIR}/kairos-container-image.ref"

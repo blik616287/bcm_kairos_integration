@@ -138,7 +138,7 @@ ${INDENTED_KEY}
           permissions: 0600
           owner: 0
           group: 0
-    - name: "BCM integration: set NOSYNC + start cmd chroot"
+    - name: "BCM integration: set NOSYNC + start cmd"
       commands:
         - |
           # Wait for network to be ready
@@ -147,50 +147,58 @@ ${INDENTED_KEY}
             sleep 2
           done
 
+          # Get BCM-assigned node name from DHCP hostname
+          NODE_NAME=\$(hostname)
+
           # Set installmode NOSYNC on BCM head node to prevent re-provisioning
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
               root@${HEAD_NODE_IP} \
-              "echo -e 'device\nuse ${EDGE_HOST_NAME}\nset installmode NOSYNC\ncommit' | cmsh" \
-              >/dev/null 2>&1 && echo "bcm-init: NOSYNC set" || echo "bcm-init: NOSYNC failed"
+              "echo -e 'device\nuse \${NODE_NAME}\nset installmode NOSYNC\ncommit' | cmsh" \
+              >/dev/null 2>&1 || true
 
-          # NFS mount BCM default-image rootfs for cmd chroot
+          # NFS mount BCM default-image rootfs
           mkdir -p /var/lib/cm/rootfs
           mount -t nfs -o ro,nolock,vers=3 ${HEAD_NODE_IP}:/cm/images/default-image /var/lib/cm/rootfs 2>/dev/null || {
-            echo "bcm-init: NFS mount failed"; exit 0
+            exit 0
           }
 
-          # Mount /cm/shared (writable)
-          mount -t nfs -o rw,nolock,vers=3 ${HEAD_NODE_IP}:/cm/shared /var/lib/cm/rootfs/cm/shared 2>/dev/null || true
-
-          # Mount essentials for chroot
-          mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
-          mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
-          mount --bind /dev /var/lib/cm/rootfs/dev 2>/dev/null || true
-
-          # Writable tmpfs for cmd runtime state (NFS rootfs is read-only)
-          mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/spool/cmd 2>/dev/null || true
-          mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/run 2>/dev/null || true
-          mount -t tmpfs tmpfs /var/lib/cm/rootfs/tmp 2>/dev/null || true
-
-          # Writable overlay for cmd config (need to set Master IP)
+          # Prepare cmd config with correct Master IP + SSL certs
           mkdir -p /var/lib/cm/cmd-etc
-          cp /var/lib/cm/rootfs/cm/local/apps/cmd/etc/* /var/lib/cm/cmd-etc/ 2>/dev/null || true
-          mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
+          cp -a /var/lib/cm/rootfs/cm/local/apps/cmd/etc/. /var/lib/cm/cmd-etc/ 2>/dev/null || true
           sed -i "s/Master = master/Master = ${HEAD_NODE_IP}/" /var/lib/cm/cmd-etc/cmd.conf
+          # Fetch node-specific SSL certs from BCM (stored by MAC address)
+          NODE_MAC=\$(ip link show ens3 2>/dev/null | awk '/ether/{print \$2}' | tr ':' '-')
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i /var/lib/bcm/bcm-key \
+              root@${HEAD_NODE_IP}:/cm/node-installer/certificates/\${NODE_MAC}/cert \
+              /var/lib/cm/cmd-etc/cert.pem 2>/dev/null || true
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i /var/lib/bcm/bcm-key \
+              root@${HEAD_NODE_IP}:/cm/node-installer/certificates/\${NODE_MAC}/key \
+              /var/lib/cm/cmd-etc/cert.key 2>/dev/null || true
 
-          # Copy network info into chroot
-          cp /etc/resolv.conf /var/lib/cm/rootfs/etc/resolv.conf 2>/dev/null || true
-          echo "${EDGE_HOST_NAME}" > /var/lib/cm/rootfs/etc/hostname 2>/dev/null || true
-
-          # Start cmd daemon in slave mode inside chroot (background)
-          chroot /var/lib/cm/rootfs /bin/bash -c '
-            export HOSTNAME=${EDGE_HOST_NAME}
-            mkdir -p /var/spool/cmd /var/run
-            /cm/local/apps/cmd/sbin/cmd -s -n &
-          ' >/dev/null 2>&1 &
-
-          echo "bcm-init: cmd chroot started"
+          # Run cmd in isolated mount namespace (unshare prevents mount leaks to host)
+          # NFS rootfs has var/run -> /run symlink; inside the namespace, mounting
+          # tmpfs on it only affects the namespace, not the host's /run.
+          unshare --mount --fork /bin/bash -c "
+            # Bind-mount cmd config overlay onto NFS rootfs (in our private namespace)
+            mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
+            # Now chroot into the NFS rootfs
+            mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
+            mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
+            mount -t tmpfs tmpfs /var/lib/cm/rootfs/tmp 2>/dev/null || true
+            mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/run 2>/dev/null || true
+            mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/spool/cmd 2>/dev/null || true
+            cp /etc/resolv.conf /var/lib/cm/rootfs/tmp/resolv.conf 2>/dev/null || true
+            mount --bind /var/lib/cm/rootfs/tmp/resolv.conf /var/lib/cm/rootfs/etc/resolv.conf 2>/dev/null || true
+            echo \${NODE_NAME} > /var/lib/cm/rootfs/tmp/hostname 2>/dev/null || true
+            mount --bind /var/lib/cm/rootfs/tmp/hostname /var/lib/cm/rootfs/etc/hostname 2>/dev/null || true
+            exec chroot /var/lib/cm/rootfs /bin/bash -c '
+              export HOSTNAME=\$(cat /etc/hostname)
+              /cm/local/apps/cmd/sbin/cmd -s -n
+            '
+          " &
 BCMEOF
     )
 fi
@@ -199,12 +207,12 @@ cat > "${AURORABOOT_DIR}/cloud-config.yaml" <<CLOUDCONFIG
 #cloud-config
 
 # Palette Edge Registration
+# NOTE: stylus.site.name is set dynamically at boot from BCM-assigned hostname
 stylus:
   site:
     paletteEndpoint: ${PALETTE_ENDPOINT}
     edgeHostToken: ${PALETTE_TOKEN}
     projectUid: ${PALETTE_PROJECT_UID}
-    name: ${EDGE_HOST_NAME}
 
 users:
   - name: kairos
@@ -218,7 +226,33 @@ users:
     lock_passwd: false
 
 stages:
+  rootfs:
+    - name: "Fix recovery mount for auto-reset"
+      commands:
+        - |
+          # AuroraBoot's 01_reset.yaml runs kairos-agent reset in the network stage.
+          # kairos-agent looks for recovery.img at /run/initramfs/cos-state/cOS/recovery.img
+          # but immucore mounts COS_STATE over COS_RECOVERY at that path, hiding the image.
+          # Fix: if in recovery mode and recovery.img is not visible, remount COS_RECOVERY there.
+          if [ -f /run/cos/recovery_mode ] || grep -q "cos-img/filename=/cOS/recovery.img" /proc/cmdline 2>/dev/null; then
+            if [ ! -f /run/initramfs/cos-state/cOS/recovery.img ]; then
+              RECOVERY_DEV=\$(blkid -L COS_RECOVERY 2>/dev/null)
+              if [ -n "\$RECOVERY_DEV" ]; then
+                umount /run/initramfs/cos-state 2>/dev/null || true
+                mount -o ro "\$RECOVERY_DEV" /run/initramfs/cos-state 2>/dev/null || true
+                echo "fix-recovery: remounted COS_RECOVERY at /run/initramfs/cos-state"
+              fi
+            fi
+          fi
   boot:
+    - name: "Set Palette edge name from BCM hostname"
+      commands:
+        - |
+          # Write stylus site name from DHCP-assigned hostname (set by BCM)
+          # This runs before stylus-agent reads config from /oem/
+          NODE_NAME=\$(hostname)
+          printf '#cloud-config\nstylus:\n  site:\n    name: %s\n' "\${NODE_NAME}" > /oem/91_palette_name.yaml
+          echo "palette: edge name set to \${NODE_NAME}"
     - name: "Set kairos user password"
       users:
         kairos:
