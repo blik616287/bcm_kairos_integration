@@ -148,13 +148,40 @@ ${INDENTED_KEY}
           done
 
           # Get BCM-assigned node name from DHCP hostname
-          NODE_NAME=\$(hostname)
+          export NODE_NAME=\$(hostname)
 
-          # Set installmode NOSYNC on BCM head node to prevent re-provisioning
+          # Install BCM head node's root SSH key so BCM can SSH to this node
+          BCM_ROOT_PUBKEY=\$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@${HEAD_NODE_IP} 'cat /root/.ssh/id_ecdsa.pub' 2>/dev/null)
+          if [ -n "\${BCM_ROOT_PUBKEY}" ]; then
+            mkdir -p /root/.ssh
+            grep -qF "\${BCM_ROOT_PUBKEY}" /root/.ssh/authorized_keys 2>/dev/null || \
+              echo "\${BCM_ROOT_PUBKEY}" >> /root/.ssh/authorized_keys
+            chmod 600 /root/.ssh/authorized_keys
+          fi
+
+          # Configure node on BCM head node:
+          # - NOSYNC prevents BCM from re-provisioning (rsyncing default-image over Kairos)
+          # - Disable health checks that don't apply to Kairos edge nodes
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
               root@${HEAD_NODE_IP} \
               "echo -e 'device\nuse \${NODE_NAME}\nset installmode NOSYNC\ncommit' | cmsh" \
+              >/dev/null 2>&1 || true
+
+          # Create kairos category (if not exists) and disable irrelevant health checks
+          # interfaces: checks BCM-managed network interfaces (Kairos manages its own)
+          # mounts: checks /dev/pts etc inside chroot (not relevant)
+          # ntp: checks for ntpd inside chroot (Kairos runs its own time sync)
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@${HEAD_NODE_IP} \
+              "cmsh -c 'category; list' | grep -q kairos || cmsh -c 'category; clone default kairos; commit'
+          cmsh -c 'category; use kairos; monitoring; setup; healthconf; use interfaces; set disabled yes; commit'
+          cmsh -c 'category; use kairos; monitoring; setup; healthconf; use mounts; set disabled yes; commit'
+          cmsh -c 'category; use kairos; monitoring; setup; healthconf; use ntp; set disabled yes; commit'
+          cmsh -c 'device; use \${NODE_NAME}; set category kairos; commit'" \
               >/dev/null 2>&1 || true
 
           # NFS mount BCM default-image rootfs
