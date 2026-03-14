@@ -253,24 +253,6 @@ users:
     lock_passwd: false
 
 stages:
-  rootfs:
-    - name: "Fix recovery mount for auto-reset"
-      commands:
-        - |
-          # AuroraBoot's 01_reset.yaml runs kairos-agent reset in the network stage.
-          # kairos-agent looks for recovery.img at /run/initramfs/cos-state/cOS/recovery.img
-          # but immucore mounts COS_STATE over COS_RECOVERY at that path, hiding the image.
-          # Fix: if in recovery mode and recovery.img is not visible, remount COS_RECOVERY there.
-          if [ -f /run/cos/recovery_mode ] || grep -q "cos-img/filename=/cOS/recovery.img" /proc/cmdline 2>/dev/null; then
-            if [ ! -f /run/initramfs/cos-state/cOS/recovery.img ]; then
-              RECOVERY_DEV=\$(blkid -L COS_RECOVERY 2>/dev/null)
-              if [ -n "\$RECOVERY_DEV" ]; then
-                umount /run/initramfs/cos-state 2>/dev/null || true
-                mount -o ro "\$RECOVERY_DEV" /run/initramfs/cos-state 2>/dev/null || true
-                echo "fix-recovery: remounted COS_RECOVERY at /run/initramfs/cos-state"
-              fi
-            fi
-          fi
   boot:
     - name: "Set Palette edge name from BCM hostname"
       commands:
@@ -311,6 +293,47 @@ docker run --privileged \
     --set "container_image=${CONTAINER_IMAGE}" \
     --set "state_dir=/aurora" \
     --cloud-config /aurora/cloud-config.yaml
+
+# ---- Inject recovery mount fix into OEM partition ----
+# AuroraBoot's 01_reset.yaml runs kairos-agent reset in the network stage, but
+# kairos-agent can't find the recovery image because COS_STATE is mounted over
+# COS_RECOVERY at /run/initramfs/cos-state. This file runs BEFORE 01_reset.yaml
+# (alphabetical order: 00 < 01) and fixes the mount.
+cat > "${AURORABOOT_DIR}/00_fix_recovery.yaml" <<'FIXEOF'
+#cloud-config
+stages:
+  network:
+    - name: "Fix recovery mount for auto-reset"
+      if: '[ -f /run/cos/recovery_mode ] || grep -q "cos-img/filename=/cOS/recovery.img" /proc/cmdline'
+      commands:
+        - |
+          if [ ! -f /run/initramfs/cos-state/cOS/recovery.img ]; then
+            RECOVERY_DEV=$(blkid -L COS_RECOVERY 2>/dev/null)
+            if [ -n "$RECOVERY_DEV" ]; then
+              umount /run/initramfs/cos-state 2>/dev/null || true
+              mount -o ro "$RECOVERY_DEV" /run/initramfs/cos-state 2>/dev/null || true
+            fi
+          fi
+FIXEOF
+
+# Mount OEM partition from raw image and inject the fix
+echo "Injecting recovery fix into OEM partition..."
+RAW_CANDIDATES=("${AURORABOOT_DIR}/"*.raw "${AURORABOOT_DIR}/"*/*.raw)
+for f in "${RAW_CANDIDATES[@]}"; do
+    [[ -f "$f" ]] && INJECT_RAW="$f" && break
+done
+if [[ -n "${INJECT_RAW:-}" ]]; then
+    OEM_OFFSET=$(fdisk -l "$INJECT_RAW" 2>/dev/null | awk '/Linux filesystem/{print $2; exit}')
+    if [[ -n "$OEM_OFFSET" ]]; then
+        MOUNT_DIR=$(mktemp -d)
+        mount -o loop,offset=$((OEM_OFFSET * 512)) "$INJECT_RAW" "$MOUNT_DIR" 2>/dev/null && {
+            cp "${AURORABOOT_DIR}/00_fix_recovery.yaml" "$MOUNT_DIR/"
+            ls "$MOUNT_DIR"/*.yaml
+            umount "$MOUNT_DIR"
+        } || echo "WARN: Could not mount OEM partition for injection"
+        rmdir "$MOUNT_DIR" 2>/dev/null
+    fi
+fi
 
 # ---- Locate and move output ----
 echo "[3/3] Locating output..."
