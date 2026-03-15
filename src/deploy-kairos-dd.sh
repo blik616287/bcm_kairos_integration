@@ -570,7 +570,7 @@ while true; do
         exit 1
     fi
 
-    NODE_STATUS=$(${SSH_CMD} "cmsh -c 'device; use node001; status' 2>/dev/null" 2>/dev/null | filter_motd || true)
+    NODE_STATUS=$(${SSH_CMD} "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${COMPUTE_MAC}'" 2>/dev/null | filter_motd || true)
     if echo "$NODE_STATUS" | grep -q "UP"; then
         echo ""
         echo "[OK] Phase 1: Node provisioned by BCM (${elapsed}s)"
@@ -610,10 +610,11 @@ while true; do
         exit 1
     fi
 
-    # Get node IP from cmsh (reliable) or fall back to DHCP leases
-    KAIROS_IP=$(${SSH_CMD} "cmsh -c 'device; use node001; get ip' 2>/dev/null" 2>/dev/null | filter_motd | grep -oP '10\.\d+\.\d+\.\d+' || true)
+    # Get node IP from DHCP leases by MAC address (no node name dependency)
+    KAIROS_IP=$(${SSH_CMD} "awk '/$(echo ${COMPUTE_MAC} | tr ':' ':')/{found=1} found && /lease /{print \$2; exit}' /var/lib/dhcpd/dhcpd.leases 2>/dev/null" 2>/dev/null | filter_motd || true)
     if [[ -z "$KAIROS_IP" ]]; then
-        KAIROS_IP=$(${SSH_CMD} "grep -oP '(?<=lease )10\\.141\\.[0-9]+\\.[0-9]+' /var/lib/dhcpd/dhcpd.leases 2>/dev/null | tail -1" 2>/dev/null | filter_motd || true)
+        # Fallback: get IP from cmsh device list by MAC
+        KAIROS_IP=$(${SSH_CMD} "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${COMPUTE_MAC}' | grep -oP '10\.\d+\.\d+\.\d+'" 2>/dev/null | filter_motd || true)
     fi
 
     if [[ -n "$KAIROS_IP" ]]; then
@@ -649,8 +650,14 @@ done
 # ---- Phase 3: Set NOSYNC and validate ----
 if [[ "$kairos_booted" == "true" ]]; then
     echo "[..] Phase 3: Setting installmode NOSYNC to prevent re-provisioning..."
-    ${SSH_CMD} "echo -e 'device\nuse node001\nset installmode NOSYNC\ncommit' | cmsh" 2>/dev/null | filter_motd || true
-    echo "[OK] installmode set to NOSYNC"
+    # Look up device name by MAC, then set NOSYNC
+    BCM_NODE=$(${SSH_CMD} "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${COMPUTE_MAC}' | awk '{print \$2}'" 2>/dev/null | filter_motd || true)
+    if [[ -n "$BCM_NODE" ]]; then
+        ${SSH_CMD} "echo -e 'device\nuse ${BCM_NODE}\nset installmode NOSYNC\ncommit' | cmsh" 2>/dev/null | filter_motd || true
+        echo "[OK] installmode set to NOSYNC for ${BCM_NODE}"
+    else
+        echo "[WARN] Could not find device by MAC ${COMPUTE_MAC} - boot stage will handle NOSYNC"
+    fi
 
     # Helper: SSH to Kairos node via BCM head node (try root key auth, then kairos password auth)
     kairos_ssh() {

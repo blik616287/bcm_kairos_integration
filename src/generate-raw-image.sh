@@ -1,16 +1,11 @@
 #!/bin/bash
 # generate-raw-image.sh
 #
-# Generates a raw disk image with full COS partition layout using AuroraBoot.
-# Takes the container image built by build-kairos-container.sh and produces
-# a raw disk image ready for dd onto a compute node.
+# Generates a fully-installed Kairos raw disk image by running kairos-agent
+# install inside a QEMU VM. The resulting disk boots directly into active mode
+# with all 5 COS partitions pre-created (no recovery reset needed).
 #
-# The raw image contains:
-#   - COS_GRUB    (EFI — GRUB bootloader)
-#   - COS_OEM     (cloud-config, userdata)
-#   - COS_RECOVERY (Kairos squashfs system image)
-#
-# On first boot, Kairos creates COS_STATE and COS_PERSISTENT automatically.
+# Requires: the CanvOS ISO from build-canvos.sh
 #
 # Usage:
 #   ./generate-raw-image.sh [OPTIONS]
@@ -23,25 +18,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
-AURORABOOT_DIR="${BUILD_DIR}/auroraboot"
 
 # Palette registration (from env vars or env.json via Makefile)
 PALETTE_ENDPOINT="${PALETTE_ENDPOINT:-api.spectrocloud.com}"
 PALETTE_TOKEN="${PALETTE_TOKEN:?ERROR: PALETTE_TOKEN not set. Set in env.json or export PALETTE_TOKEN}"
 PALETTE_PROJECT_UID="${PALETTE_PROJECT_UID:?ERROR: PALETTE_PROJECT_UID not set. Set in env.json or export PALETTE_PROJECT_UID}"
-EDGE_HOST_NAME="${EDGE_HOST_NAME:-node001}"
 
 # BCM integration
 BCM_PASSWORD="${BCM_PASSWORD:-}"
 HEAD_NODE_IP="${HEAD_NODE_IP:-10.141.255.254}"
 BCM_SSH_KEY="${BCM_SSH_KEY:-}"  # Path to private key for SSH to BCM head node
 
-# AuroraBoot config
-AURORABOOT_IMAGE="quay.io/kairos/auroraboot"
+# Disk config
 DISK_SIZE="${DISK_SIZE:-81920}"  # MB
 
-# Container image ref
-IMAGE_REF_FILE="${BUILD_DIR}/kairos-container-image.ref"
+# ISO from kairos-build
+ISO_NAME="${ISO_NAME:-palette-edge-installer}"
+KAIROS_ISO="${BUILD_DIR}/${ISO_NAME}.iso"
 
 CLEAN=false
 
@@ -49,18 +42,16 @@ usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
 
-Generates a Kairos raw disk image via AuroraBoot with COS partition layout.
+Generates a Kairos raw disk image by running kairos-agent install in QEMU.
+The resulting disk boots directly into active mode (no recovery reset needed).
 
 Options:
-  --image-ref FILE     Path to container image reference file
-                       (default: build/kairos-container-image.ref)
-  --edge-name NAME     Edge host name for Palette + BCM (default: node001)
   --disk-size MB       Raw disk size in MB (default: 81920)
   --clean              Remove existing artifacts first
   -h, --help           Show this help
 
 Outputs:
-  build/kairos-disk.raw          Raw disk image with COS partitions
+  build/kairos-disk.raw          Raw disk image (all 5 COS partitions)
   build/kairos-disk.raw.sha256   Checksum
 EOF
     exit 0
@@ -68,8 +59,6 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --image-ref)   IMAGE_REF_FILE="$2"; shift 2 ;;
-        --edge-name)   EDGE_HOST_NAME="$2"; shift 2 ;;
         --disk-size)   DISK_SIZE="$2"; shift 2 ;;
         --clean)       CLEAN=true; shift ;;
         -h|--help)     usage ;;
@@ -78,42 +67,33 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- Preflight ----
-if [[ ! -f "$IMAGE_REF_FILE" ]]; then
-    echo "ERROR: Container image reference not found at $IMAGE_REF_FILE"
-    echo "Build it first: ./build-kairos-container.sh"
+if [[ ! -f "$KAIROS_ISO" ]]; then
+    echo "ERROR: Kairos ISO not found at $KAIROS_ISO"
+    echo "Build it first: make kairos-build"
     exit 1
 fi
 
-CONTAINER_IMAGE=$(cat "$IMAGE_REF_FILE")
-echo "Container image: ${CONTAINER_IMAGE}"
-
-if ! command -v docker &>/dev/null; then
-    echo "ERROR: Docker not found."
+if ! command -v qemu-system-x86_64 &>/dev/null; then
+    echo "ERROR: qemu-system-x86_64 not found."
     exit 1
 fi
 
 # ---- Clean ----
 if [[ "$CLEAN" == "true" ]]; then
     echo "Cleaning existing artifacts..."
-    rm -rf "${AURORABOOT_DIR}"
     rm -f "${BUILD_DIR}/kairos-disk.raw" "${BUILD_DIR}/kairos-disk.raw.sha256"
+    rm -f "${BUILD_DIR}/cloud-init.iso"
 fi
 
-mkdir -p "${AURORABOOT_DIR}"
-
 echo "============================================"
-echo " Generating Kairos Raw Disk Image"
+echo " Generating Kairos Raw Disk Image (QEMU)"
 echo "============================================"
-echo " Container: ${CONTAINER_IMAGE}"
+echo " ISO:       ${KAIROS_ISO}"
 echo " Disk size: ${DISK_SIZE} MB"
-echo " Edge name: ${EDGE_HOST_NAME}"
 echo "============================================"
 echo ""
 
-# ---- Generate cloud-config ----
-echo "[1/3] Generating cloud-config..."
-
-# Read BCM SSH private key if provided
+# ---- Read BCM SSH private key ----
 BCM_SSH_KEY_CONTENT=""
 if [[ -n "$BCM_SSH_KEY" && -f "$BCM_SSH_KEY" ]]; then
     BCM_SSH_KEY_CONTENT=$(cat "$BCM_SSH_KEY")
@@ -123,10 +103,9 @@ elif [[ -f "${BUILD_DIR}/bcm-kairos-key" ]]; then
     echo "  BCM SSH key: ${BUILD_DIR}/bcm-kairos-key"
 fi
 
-# Build the BCM integration stages block if we have credentials
+# ---- Build BCM integration stages ----
 BCM_STAGES=""
 if [[ -n "$BCM_SSH_KEY_CONTENT" ]]; then
-    # Indent the key content for YAML embedding (10 spaces for file content block)
     INDENTED_KEY=$(echo "$BCM_SSH_KEY_CONTENT" | sed 's/^/              /')
 
     BCM_STAGES=$(cat <<BCMEOF
@@ -147,8 +126,20 @@ ${INDENTED_KEY}
             sleep 2
           done
 
-          # Get BCM-assigned node name from DHCP hostname
-          export NODE_NAME=\$(hostname)
+          # Get BCM-assigned node name by querying BCM via MAC address
+          NODE_MAC=\$(ip link show ens3 2>/dev/null | awk '/ether/{print \$2}')
+          export NODE_NAME=\$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@${HEAD_NODE_IP} \
+              "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '\${NODE_MAC}' | awk '{print \\\$2}'" \
+              2>/dev/null)
+          if [ -z "\${NODE_NAME}" ]; then
+            export NODE_NAME=\$(hostname)
+          fi
+          hostnamectl set-hostname "\${NODE_NAME}" 2>/dev/null || hostname "\${NODE_NAME}" 2>/dev/null || true
+
+          # Write Palette edge name for stylus-agent
+          printf '#cloud-config\nstylus:\n  site:\n    name: %s\n' "\${NODE_NAME}" > /oem/91_palette_name.yaml
 
           # Install BCM head node's root SSH key so BCM can SSH to this node
           BCM_ROOT_PUBKEY=\$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -161,19 +152,14 @@ ${INDENTED_KEY}
             chmod 600 /root/.ssh/authorized_keys
           fi
 
-          # Configure node on BCM head node:
-          # - NOSYNC prevents BCM from re-provisioning (rsyncing default-image over Kairos)
-          # - Disable health checks that don't apply to Kairos edge nodes
+          # Configure node on BCM head node
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
               root@${HEAD_NODE_IP} \
               "echo -e 'device\nuse \${NODE_NAME}\nset installmode NOSYNC\ncommit' | cmsh" \
               >/dev/null 2>&1 || true
 
-          # Create kairos category (if not exists) and disable irrelevant health checks
-          # interfaces: checks BCM-managed network interfaces (Kairos manages its own)
-          # mounts: checks /dev/pts etc inside chroot (not relevant)
-          # ntp: checks for ntpd inside chroot (Kairos runs its own time sync)
+          # Create kairos category and disable irrelevant health checks
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
               root@${HEAD_NODE_IP} \
@@ -194,7 +180,6 @@ ${INDENTED_KEY}
           mkdir -p /var/lib/cm/cmd-etc
           cp -a /var/lib/cm/rootfs/cm/local/apps/cmd/etc/. /var/lib/cm/cmd-etc/ 2>/dev/null || true
           sed -i "s/Master = master/Master = ${HEAD_NODE_IP}/" /var/lib/cm/cmd-etc/cmd.conf
-          # Fetch node-specific SSL certs from BCM (stored by MAC address)
           NODE_MAC=\$(ip link show ens3 2>/dev/null | awk '/ether/{print \$2}' | tr ':' '-')
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -i /var/lib/bcm/bcm-key \
@@ -205,13 +190,9 @@ ${INDENTED_KEY}
               root@${HEAD_NODE_IP}:/cm/node-installer/certificates/\${NODE_MAC}/key \
               /var/lib/cm/cmd-etc/cert.key 2>/dev/null || true
 
-          # Run cmd in isolated mount namespace (unshare prevents mount leaks to host)
-          # NFS rootfs has var/run -> /run symlink; inside the namespace, mounting
-          # tmpfs on it only affects the namespace, not the host's /run.
+          # Run cmd in isolated mount namespace via unshare
           unshare --mount --fork /bin/bash -c "
-            # Bind-mount cmd config overlay onto NFS rootfs (in our private namespace)
             mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
-            # Now chroot into the NFS rootfs
             mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
             mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
             mount -t tmpfs tmpfs /var/lib/cm/rootfs/tmp 2>/dev/null || true
@@ -230,11 +211,21 @@ BCMEOF
     )
 fi
 
-cat > "${AURORABOOT_DIR}/cloud-config.yaml" <<CLOUDCONFIG
+# ---- Generate cloud-config for install ----
+echo "[1/3] Generating cloud-config..."
+
+CLOUD_CONFIG_DIR=$(mktemp -d)
+mkdir -p "${CLOUD_CONFIG_DIR}"
+
+cat > "${CLOUD_CONFIG_DIR}/config.yaml" <<CLOUDCONFIG
 #cloud-config
 
+# Auto-install: kairos-agent install runs automatically and powers off
+install:
+  auto: true
+  poweroff: true
+
 # Palette Edge Registration
-# NOTE: stylus.site.name is set dynamically at boot from BCM-assigned hostname
 stylus:
   site:
     paletteEndpoint: ${PALETTE_ENDPOINT}
@@ -254,14 +245,6 @@ users:
 
 stages:
   boot:
-    - name: "Set Palette edge name from BCM hostname"
-      commands:
-        - |
-          # Write stylus site name from DHCP-assigned hostname (set by BCM)
-          # This runs before stylus-agent reads config from /oem/
-          NODE_NAME=\$(hostname)
-          printf '#cloud-config\nstylus:\n  site:\n    name: %s\n' "\${NODE_NAME}" > /oem/91_palette_name.yaml
-          echo "palette: edge name set to \${NODE_NAME}"
     - name: "Set kairos user password"
       users:
         kairos:
@@ -278,115 +261,120 @@ stages:
 ${BCM_STAGES}
 CLOUDCONFIG
 
-# ---- Run AuroraBoot ----
-echo "[2/3] Running AuroraBoot (this may take a while)..."
+# Create a FAT32 disk image with user-data (Kairos scans all block devices)
+echo "  Creating user-data disk..."
+USERDATA_IMG="${BUILD_DIR}/userdata.img"
+dd if=/dev/zero of="${USERDATA_IMG}" bs=1M count=4 status=none
+mkfs.vfat -n CIDATA "${USERDATA_IMG}" >/dev/null
+mcopy -i "${USERDATA_IMG}" "${CLOUD_CONFIG_DIR}/config.yaml" "::user-data"
+rm -rf "${CLOUD_CONFIG_DIR}"
 
-docker run --privileged \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "${AURORABOOT_DIR}:/aurora" \
-    --rm \
-    "${AURORABOOT_IMAGE}" \
-    --set "disable_http_server=true" \
-    --set "disable_netboot=true" \
-    --set "disk.efi=true" \
-    --set "disk.size=${DISK_SIZE}" \
-    --set "container_image=${CONTAINER_IMAGE}" \
-    --set "state_dir=/aurora" \
-    --cloud-config /aurora/cloud-config.yaml
+# ---- Create blank disk ----
+echo "[2/3] Creating blank disk (${DISK_SIZE}MB)..."
+truncate -s "${DISK_SIZE}M" "${BUILD_DIR}/kairos-disk.raw"
 
-# ---- Inject recovery mount fix into OEM partition ----
-# AuroraBoot's 01_reset.yaml runs kairos-agent reset in the network stage, but
-# kairos-agent can't find the recovery image because COS_STATE is mounted over
-# COS_RECOVERY at /run/initramfs/cos-state. This file runs BEFORE 01_reset.yaml
-# (alphabetical order: 00 < 01) and fixes the mount.
-cat > "${AURORABOOT_DIR}/00_fix_recovery.yaml" <<'FIXEOF'
-#cloud-config
-stages:
-  network:
-    - name: "Fix recovery mount for auto-reset"
-      if: '[ -f /run/cos/recovery_mode ] || grep -q "cos-img/filename=/cOS/recovery.img" /proc/cmdline'
-      commands:
-        - |
-          if [ ! -f /run/initramfs/cos-state/cOS/recovery.img ]; then
-            RECOVERY_DEV=$(blkid -L COS_RECOVERY 2>/dev/null)
-            if [ -n "$RECOVERY_DEV" ]; then
-              umount /run/initramfs/cos-state 2>/dev/null || true
-              mount -o ro "$RECOVERY_DEV" /run/initramfs/cos-state 2>/dev/null || true
-            fi
-          fi
-FIXEOF
+# ---- Run QEMU install ----
+echo "[3/3] Running kairos-agent install in QEMU..."
+echo "  Boots CanvOS ISO, runs kairos-agent install via serial, powers off."
 
-# Mount OEM partition from raw image and inject the fix
-echo "Injecting recovery fix into OEM partition..."
-RAW_CANDIDATES=("${AURORABOOT_DIR}/"*.raw "${AURORABOOT_DIR}/"*/*.raw)
-for f in "${RAW_CANDIDATES[@]}"; do
-    [[ -f "$f" ]] && INJECT_RAW="$f" && break
+QEMU_LOG="${PROJECT_DIR}/logs/qemu-install.log"
+mkdir -p "${PROJECT_DIR}/logs"
+
+# Find OVMF firmware
+OVMF=""
+for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+    [[ -f "$f" ]] && OVMF="$f" && break
 done
-if [[ -n "${INJECT_RAW:-}" ]]; then
-    OEM_OFFSET=$(fdisk -l "$INJECT_RAW" 2>/dev/null | awk '/Linux filesystem/{print $2; exit}')
-    if [[ -n "$OEM_OFFSET" ]]; then
-        MOUNT_DIR=$(mktemp -d)
-        mount -o loop,offset=$((OEM_OFFSET * 512)) "$INJECT_RAW" "$MOUNT_DIR" 2>/dev/null && {
-            cp "${AURORABOOT_DIR}/00_fix_recovery.yaml" "$MOUNT_DIR/"
-            ls "$MOUNT_DIR"/*.yaml
-            umount "$MOUNT_DIR"
-        } || echo "WARN: Could not mount OEM partition for injection"
-        rmdir "$MOUNT_DIR" 2>/dev/null
-    fi
-fi
-
-# ---- Locate and move output ----
-echo "[3/3] Locating output..."
-
-# AuroraBoot places disk.raw in the state dir or a subdirectory
-RAW_FILE=""
-for candidate in "${AURORABOOT_DIR}/disk.raw" "${AURORABOOT_DIR}/"*/disk.raw; do
-    if [[ -f "$candidate" ]]; then
-        RAW_FILE="$candidate"
-        break
-    fi
-done
-
-if [[ -z "$RAW_FILE" ]]; then
-    # Search more broadly
-    RAW_FILE=$(find "${AURORABOOT_DIR}" -name "*.raw" -type f | head -1)
-fi
-
-if [[ -z "$RAW_FILE" || ! -f "$RAW_FILE" ]]; then
-    echo "ERROR: Raw disk image not found in ${AURORABOOT_DIR}"
-    echo "Contents:"
-    find "${AURORABOOT_DIR}" -type f 2>/dev/null
+if [[ -z "$OVMF" ]]; then
+    echo "ERROR: OVMF/UEFI firmware not found"
     exit 1
 fi
 
-if [[ "$RAW_FILE" != "${BUILD_DIR}/kairos-disk.raw" ]]; then
-    mv "$RAW_FILE" "${BUILD_DIR}/kairos-disk.raw"
+# Launch QEMU in background with serial socket
+QEMU_SERIAL_SOCK="${BUILD_DIR}/.qemu-install.sock"
+rm -f "$QEMU_SERIAL_SOCK"
+
+qemu-system-x86_64 \
+    -enable-kvm \
+    -m 4096 \
+    -smp 2 \
+    -cpu host \
+    -bios "$OVMF" \
+    -display none \
+    -chardev socket,id=ser0,path="${QEMU_SERIAL_SOCK}",server=on,wait=off \
+    -serial chardev:ser0 \
+    -drive if=virtio,format=raw,media=disk,file="${BUILD_DIR}/kairos-disk.raw" \
+    -drive if=virtio,format=raw,readonly=on,file="${BUILD_DIR}/userdata.img" \
+    -drive format=raw,media=cdrom,readonly=on,file="${KAIROS_ISO}" \
+    -boot d \
+    -pidfile "${BUILD_DIR}/.qemu-install.pid" \
+    -daemonize
+
+QEMU_PID=$(cat "${BUILD_DIR}/.qemu-install.pid")
+echo "  QEMU started (PID ${QEMU_PID})"
+
+# Wait for ISO to boot to root shell, then drive install via serial
+echo "  Waiting for CanvOS ISO to boot..."
+sleep 90  # GRUB timeout + kernel boot + systemd init
+
+echo "  Running kairos-agent install via serial..."
+# Send install commands: copy cloud-config to /oem/, run kairos-agent install
+# kairos-agent install reads config from /oem/*.yaml, creates all partitions,
+# deploys active+recovery images, then powers off the VM.
+(
+    sleep 2
+    printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml\r\n'
+    sleep 3
+    printf 'kairos-agent --debug install 2>&1; poweroff\r\n'
+    sleep 600
+) | nc -U "$QEMU_SERIAL_SOCK" 2>&1 | tee "$QEMU_LOG" &
+SERIAL_PID=$!
+
+# Wait for QEMU to exit (install completes then VM powers off)
+echo "  Waiting for install to complete..."
+while kill -0 "$QEMU_PID" 2>/dev/null; do
+    sleep 10
+    # Show progress dots
+    printf "."
+done
+echo ""
+
+kill "$SERIAL_PID" 2>/dev/null || true
+wait "$SERIAL_PID" 2>/dev/null || true
+rm -f "$QEMU_SERIAL_SOCK" "${BUILD_DIR}/.qemu-install.pid" "${BUILD_DIR}/userdata.img"
+
+echo "  Install complete."
+
+# ---- Validate ----
+echo ""
+echo "Validating partition layout..."
+
+FDISK_OUT=$(fdisk -l "${BUILD_DIR}/kairos-disk.raw" 2>/dev/null || true)
+echo "$FDISK_OUT"
+
+PART_COUNT=$(echo "$FDISK_OUT" | grep -c "^${BUILD_DIR}/kairos-disk.raw" || true)
+if [[ "$PART_COUNT" -ge 5 ]]; then
+    echo ""
+    echo "  [OK] Found ${PART_COUNT} partitions (all 5 COS partitions present)"
+else
+    echo ""
+    echo "  [WARN] Found ${PART_COUNT} partitions (expected 5: GRUB, OEM, RECOVERY, STATE, PERSISTENT)"
+    echo "  The install may have failed. Check ${QEMU_LOG}"
 fi
+
+# ---- Trim disk image ----
+# The QEMU install creates an 80GB disk but most of COS_PERSISTENT is empty zeros.
+# Punch holes to make it sparse — gzip compresses zeros to nearly nothing.
+echo ""
+echo "Trimming disk image..."
+ORIG_SIZE=$(du -h "${BUILD_DIR}/kairos-disk.raw" | cut -f1)
+fallocate --dig-holes "${BUILD_DIR}/kairos-disk.raw" 2>/dev/null || true
+TRIMMED_SIZE=$(du -h "${BUILD_DIR}/kairos-disk.raw" | cut -f1)
+echo "  Disk: ${ORIG_SIZE} -> ${TRIMMED_SIZE} (sparse)"
 
 # ---- Generate checksum ----
 cd "${BUILD_DIR}"
 sha256sum kairos-disk.raw > kairos-disk.raw.sha256
-
-# ---- Validate partition layout ----
-echo ""
-echo "Validating partition layout..."
-
-if command -v fdisk &>/dev/null; then
-    FDISK_OUT=$(fdisk -l "${BUILD_DIR}/kairos-disk.raw" 2>/dev/null || true)
-    echo "$FDISK_OUT"
-
-    # Check for expected partitions (at least 3 GPT partitions)
-    PART_COUNT=$(echo "$FDISK_OUT" | grep -c "^${BUILD_DIR}/kairos-disk.raw" || true)
-    if [[ "$PART_COUNT" -ge 3 ]]; then
-        echo ""
-        echo "  [OK] Found ${PART_COUNT} partitions (expected >= 3)"
-    else
-        echo ""
-        echo "  [WARN] Found ${PART_COUNT} partitions (expected >= 3)"
-    fi
-else
-    echo "  [SKIP] fdisk not available for validation"
-fi
 
 RAW_SIZE=$(du -h "${BUILD_DIR}/kairos-disk.raw" | cut -f1)
 

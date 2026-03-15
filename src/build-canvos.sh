@@ -147,6 +147,15 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
             "${CANVOS_DIR}/Earthfile"
     fi
 
+    # Copy overlay /usr/local/bin scripts into the base-image target
+    # base-image builds from a Dockerfile and doesn't copy overlay/usr/ by default.
+    # We add the COPY after the package install line (unique to base-image).
+    if ! grep -A1 'install --no-install-recommends.*kbd' "${CANVOS_DIR}/Earthfile" | grep -q 'overlay/files/usr/'; then
+        echo "Patching Earthfile: adding overlay /usr/local/bin copy to base-image..."
+        sed -i '/install --no-install-recommends.*kbd.*-y/a\        COPY --if-exists overlay/files/usr/ /usr/' \
+            "${CANVOS_DIR}/Earthfile"
+    fi
+
     echo "[1/2] Running CanvOS build (this may take a while)..."
     cd "${CANVOS_DIR}"
     ./earthly.sh +iso --ARCH="${ARCH}"
