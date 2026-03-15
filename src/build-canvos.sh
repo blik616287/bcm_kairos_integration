@@ -147,13 +147,13 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
             "${CANVOS_DIR}/Earthfile"
     fi
 
-    # Copy overlay /usr/local/bin scripts into the base-image target
-    # base-image builds from a Dockerfile and doesn't copy overlay/usr/ by default.
-    # We add the COPY after the package install line (unique to base-image).
-    if ! grep -A1 'install --no-install-recommends.*kbd' "${CANVOS_DIR}/Earthfile" | grep -q 'overlay/files/usr/'; then
-        echo "Patching Earthfile: adding overlay /usr/local/bin copy to base-image..."
-        sed -i '/install --no-install-recommends.*kbd.*-y/a\        COPY --if-exists overlay/files/usr/ /usr/' \
-            "${CANVOS_DIR}/Earthfile"
+    # Add custom scripts via the Dockerfile's documented customization point (line 31).
+    # Scripts go in /usr/bin/ (NOT /usr/local/bin/) because Kairos mounts COS_PERSISTENT
+    # over /usr/local at boot, hiding any files baked into the immutable root at that path.
+    if ! grep -q 'bcm-compat-fixes' "${CANVOS_DIR}/Dockerfile"; then
+        echo "Patching Dockerfile: adding custom BCM scripts..."
+        sed -i '/Add any other image customizations here/a\COPY overlay/files/usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-compat-fixes.sh\nCOPY overlay/files/usr/bin/bcm-sync-userdata.sh /usr/bin/bcm-sync-userdata.sh\nRUN chmod +x /usr/bin/bcm-*.sh' \
+            "${CANVOS_DIR}/Dockerfile"
     fi
 
     echo "[1/2] Running CanvOS build (this may take a while)..."
