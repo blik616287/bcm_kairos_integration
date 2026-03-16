@@ -150,6 +150,11 @@ fi
 echo "[OK] SSH connected"
 echo ""
 
+# Helper: run a command on the Kairos node using the detected auth method
+run_on_kairos() {
+    eval ${KAIROS_SSH} "'$1'" 2>/dev/null | filter_motd
+}
+
 # ---- Run validation checks ----
 echo "============================================"
 echo " Running Checks"
@@ -157,7 +162,7 @@ echo "============================================"
 echo ""
 
 # Collect all info in one SSH session to minimize round-trips
-VALIDATION=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} '
+VALIDATION=$(eval ${KAIROS_SSH} "'
 echo \"===OS_RELEASE===\"
 cat /etc/os-release 2>/dev/null
 echo \"===KAIROS_RELEASE===\"
@@ -288,7 +293,7 @@ else
 fi
 
 # Check cmd (BCM compute daemon)
-if echo "$SERVICES" | grep -q "cmd.*running" || ${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
+if echo "$SERVICES" | grep -q "cmd.*running" || run_on_kairos 'systemctl is-active cmd' 2>/dev/null | grep -q "active"; then
     check "cmd service" "PASS" "active"
 else
     check "cmd service" "FAIL" "not running"
@@ -297,10 +302,10 @@ fi
 # 10. User
 echo ""
 echo "-- User Config --"
-check "SSH login" "PASS" "root@${KAIROS_IP} (via BCM head node)"
+check "SSH login" "PASS" "${KAIROS_IP} (via BCM head node)"
 
 # Check user-data was applied
-USERDATA_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null | filter_motd || true)
+USERDATA_CHECK=$(run_on_kairos 'test -f /oem/99_userdata.yaml && echo present || echo missing' || true)
 if [[ "$USERDATA_CHECK" == *"present"* ]]; then
     check "user-data" "PASS" "/oem/99_userdata.yaml present"
 else
@@ -308,7 +313,7 @@ else
 fi
 
 # Check Palette registration
-REG_LOGS=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+REG_LOGS=$(run_on_kairos 'journalctl -u stylus-agent --no-pager' || true)
 if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
     check "Palette registration" "PASS" "registered with Palette"
 else
