@@ -323,7 +323,8 @@ echo "  Running kairos-agent install via serial..."
 # deploys active+recovery images, then powers off the VM.
 (
     sleep 2
-    printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml\r\n'
+    # Use 99_bcm.yaml to avoid collision with kairos-agent's 90_custom.yaml
+    printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/99_bcm.yaml\r\n'
     sleep 3
     printf 'kairos-agent --debug install 2>&1; poweroff\r\n'
     sleep 600
