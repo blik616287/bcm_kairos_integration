@@ -445,6 +445,13 @@ if [ -n "$ACTUAL_KERNEL" ]; then
         mkdir -p "${IMAGE_ROOT}/lib/modules/${ACTUAL_KERNEL}"
     fi
     cmsh -c "softwareimage; use kairos-installer; set kernelversion ${ACTUAL_KERNEL}; commit" 2>&1 || true
+    # Verify
+    VERIFY=$(cmsh -c "softwareimage; use kairos-installer; get kernelversion" 2>/dev/null)
+    if echo "$VERIFY" | grep -q "${ACTUAL_KERNEL}"; then
+        echo "[OK] Kernel version set to ${ACTUAL_KERNEL}"
+    else
+        echo "[WARN] Kernel version may not have been set correctly: ${VERIFY}"
+    fi
 fi
 KERNEL_FIX
 
@@ -459,7 +466,10 @@ cmsh -c "category; list" 2>/dev/null | grep -q kairos || \
     cmsh -c "category; clone default kairos; commit" 2>/dev/null
 
 # Configure kairos category with installer image and install mode
-cmsh -c "category; use kairos; set softwareimage kairos-installer; set installmode FULL; set kernelparameters 'console=tty0 console=ttyS0,115200n8'; commit" 2>&1 || true
+# Set each property in its own commit to prevent one failure from blocking others
+cmsh -c "category; use kairos; set softwareimage kairos-installer; commit" 2>&1 || true
+cmsh -c "category; use kairos; set installmode FULL; commit" 2>&1 || true
+cmsh -c "category; use kairos; set kernelparameters 'console=tty0 console=ttyS0,115200n8'; commit" 2>&1 || true
 
 # Disable health checks that don't apply to Kairos nodes
 cmsh -c "category; use kairos; monitoring; setup; healthconf; use interfaces; set disabled yes; commit" 2>&1 || true
@@ -475,7 +485,16 @@ cmsh -c "partition; use base; set defaultcategory kairos; commit" 2>&1 || true
 cmsh -c "partition; use base; set nodebasename node; set nodedigits 3; commit" 2>&1 || true
 cmsh -c "category; use kairos; set newnodeinstallmode FULL; commit" 2>&1 || true
 
-echo "[OK] kairos category configured (softwareimage=kairos-installer, installmode=FULL)"
+# Verify category configuration
+VERIFY_IMG=$(cmsh -c "category; use kairos; get softwareimage" 2>/dev/null)
+VERIFY_CAT=$(cmsh -c "partition; use base; get defaultcategory" 2>/dev/null)
+if echo "$VERIFY_IMG" | grep -q "kairos-installer"; then
+    echo "[OK] kairos category configured (softwareimage=kairos-installer, installmode=FULL)"
+else
+    echo "[FAIL] kairos category softwareimage is '${VERIFY_IMG}', expected 'kairos-installer'"
+    echo "       Retrying..."
+    cmsh -c "category; use kairos; set softwareimage kairos-installer; commit" 2>&1 || true
+fi
 echo "[OK] Default category for new nodes set to kairos"
 echo "[OK] Auto-detect enabled (unknown MACs auto-create as node001, node002, ...)"
 CATEGORY_SETUP
