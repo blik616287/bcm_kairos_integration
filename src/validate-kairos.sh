@@ -162,7 +162,7 @@ echo "============================================"
 echo ""
 
 # Collect all info in one SSH session to minimize round-trips
-VALIDATION=$(eval ${KAIROS_SSH} "'
+VALIDATION=$(${BCM_SSH} "${KAIROS_SSH} '
 echo \"===OS_RELEASE===\"
 cat /etc/os-release 2>/dev/null
 echo \"===KAIROS_RELEASE===\"
