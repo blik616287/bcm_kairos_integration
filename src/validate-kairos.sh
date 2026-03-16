@@ -292,11 +292,12 @@ else
     check "stylus-agent" "FAIL" "not running"
 fi
 
-# Check cmd (BCM compute daemon)
-if echo "$SERVICES" | grep -q "cmd.*running" || run_on_kairos 'systemctl is-active cmd' 2>/dev/null | grep -q "active"; then
-    check "cmd service" "PASS" "active"
+# Check cmd (BCM compute daemon — runs via unshare, not a systemd service)
+CMD_COUNT=$(run_on_kairos 'ps aux | grep "cmd -s -n" | grep -v grep | wc -l' || echo "0")
+if [[ "$CMD_COUNT" -gt 0 ]]; then
+    check "BCM cmd daemon" "PASS" "running (${CMD_COUNT} process(es) via unshare)"
 else
-    check "cmd service" "FAIL" "not running"
+    check "BCM cmd daemon" "WARN" "not running (boot stage may not have completed)"
 fi
 
 # 10. User
@@ -305,11 +306,11 @@ echo "-- User Config --"
 check "SSH login" "PASS" "${KAIROS_IP} (via BCM head node)"
 
 # Check user-data was applied
-USERDATA_CHECK=$(run_on_kairos 'test -f /oem/99_userdata.yaml && echo present || echo missing' || true)
+USERDATA_CHECK=$(run_on_kairos 'test -f /oem/99_bcm.yaml && echo present || test -f /oem/99_userdata.yaml && echo present || echo missing' || true)
 if [[ "$USERDATA_CHECK" == *"present"* ]]; then
-    check "user-data" "PASS" "/oem/99_userdata.yaml present"
+    check "user-data" "PASS" "cloud-config present in /oem/"
 else
-    check "user-data" "FAIL" "/oem/99_userdata.yaml missing"
+    check "user-data" "FAIL" "no cloud-config found in /oem/"
 fi
 
 # Check Palette registration
