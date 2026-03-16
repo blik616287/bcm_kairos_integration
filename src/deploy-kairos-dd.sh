@@ -469,8 +469,15 @@ cmsh -c "category; use kairos; monitoring; setup; healthconf; use ntp; set disab
 # Set kairos as the default category for new physical nodes
 cmsh -c "partition; use base; set defaultcategory kairos; commit" 2>&1 || true
 
+# Configure auto-detect: unknown MACs that PXE boot get auto-created with these settings
+# nodebasename + nodedigits control the naming (e.g., node001, node002, ...)
+# newnodeinstallmode ensures auto-detected nodes get FULL install on first boot
+cmsh -c "partition; use base; set nodebasename node; set nodedigits 3; commit" 2>&1 || true
+cmsh -c "category; use kairos; set newnodeinstallmode FULL; commit" 2>&1 || true
+
 echo "[OK] kairos category configured (softwareimage=kairos-installer, installmode=FULL)"
 echo "[OK] Default category for new nodes set to kairos"
+echo "[OK] Auto-detect enabled (unknown MACs auto-create as node001, node002, ...)"
 CATEGORY_SETUP
 
     # Configure the test VM node (node001) with the compute MAC and kairos category
