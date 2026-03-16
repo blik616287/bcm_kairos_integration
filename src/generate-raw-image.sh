@@ -323,10 +323,12 @@ echo "  Running kairos-agent install via serial..."
 # deploys active+recovery images, then powers off the VM.
 (
     sleep 2
-    # Use 99_bcm.yaml to avoid collision with kairos-agent's 90_custom.yaml
-    printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/99_bcm.yaml\r\n'
+    # Copy config to /oem/ for kairos-agent install to read (stylus validation requires it),
+    # AND save a backup to /tmp/ since the install may overwrite /oem/90_custom.yaml
+    printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml\r\n'
     sleep 3
-    printf 'kairos-agent --debug install 2>&1; poweroff\r\n'
+    # Run install, then restore our config as 99_bcm.yaml (kairos-agent overwrites 90_custom.yaml), then poweroff
+    printf 'kairos-agent --debug install 2>&1; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; poweroff\r\n'
     sleep 600
 ) | nc -U "$QEMU_SERIAL_SOCK" 2>&1 | tee "$QEMU_LOG" &
 SERIAL_PID=$!
@@ -340,6 +342,7 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
 done
 echo ""
 
+pkill -P "$SERIAL_PID" 2>/dev/null || true
 kill "$SERIAL_PID" 2>/dev/null || true
 wait "$SERIAL_PID" 2>/dev/null || true
 rm -f "$QEMU_SERIAL_SOCK" "${BUILD_DIR}/.qemu-install.pid" "${BUILD_DIR}/userdata.img"
