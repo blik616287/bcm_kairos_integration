@@ -1,10 +1,15 @@
 #!/bin/bash
 # orchestrate.sh — Run the full BCM + Kairos pipeline as a parallel DAG
 #
-# DAG:
+# Option A DAG (deploy_method=option-a):
 #   download-iso → bcm-prepare → bcm-run ──┐
 #                                           ├── kairos-deploy → kairos-run → validate
 #   kairos-build → kairos-extract ──────────┘
+#
+# Option B DAG (deploy_method=option-b):
+#   download-iso → bcm-prepare → bcm-run ──────┐
+#                                               ├── kairos-deploy-dd → kairos-run-dd → validate
+#   kairos-container → kairos-raw ──────────────┘
 #
 # Steps with existing artifacts are skipped automatically.
 # Use --clean to force a full rebuild from scratch.
@@ -86,21 +91,33 @@ detect_dirty_steps() {
                 DIRTY_STEPS[bcm-prepare]=1; DIRTY_STEPS[bcm-run]=1 ;;
             src/launch-bcm-kvm.sh)
                 DIRTY_STEPS[bcm-run]=1 ;;
+            # Option A
             src/build-canvos.sh|src/canvos/*|src/canvos/**)
-                DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1 ;;
+                DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1
+                DIRTY_STEPS[kairos-container]=1; DIRTY_STEPS[kairos-raw]=1 ;;
             src/extract-kairos-pxe.sh)
                 DIRTY_STEPS[kairos-extract]=1 ;;
             src/test-kairos-pxe.sh)
                 DIRTY_STEPS[kairos-deploy]=1; DIRTY_STEPS[kairos-run]=1 ;;
+            # Option B
+            src/build-kairos-container.sh|src/installer-overlay/*)
+                DIRTY_STEPS[kairos-container]=1; DIRTY_STEPS[kairos-raw]=1 ;;
+            src/generate-raw-image.sh)
+                DIRTY_STEPS[kairos-raw]=1 ;;
+            src/deploy-kairos-dd.sh)
+                DIRTY_STEPS[kairos-deploy-dd]=1; DIRTY_STEPS[kairos-run-dd]=1 ;;
             src/validate-kairos.sh)
                 DIRTY_STEPS[validate]=1 ;;
             Makefile)
                 DIRTY_STEPS[bcm-prepare]=1; DIRTY_STEPS[bcm-run]=1
                 DIRTY_STEPS[kairos-build]=1; DIRTY_STEPS[kairos-extract]=1
-                DIRTY_STEPS[kairos-deploy]=1 ;;
+                DIRTY_STEPS[kairos-deploy]=1
+                DIRTY_STEPS[kairos-container]=1; DIRTY_STEPS[kairos-raw]=1
+                DIRTY_STEPS[kairos-deploy-dd]=1 ;;
             env.json)
                 DIRTY_STEPS[download-iso]=1; DIRTY_STEPS[kairos-extract]=1
-                DIRTY_STEPS[kairos-deploy]=1 ;;
+                DIRTY_STEPS[kairos-deploy]=1
+                DIRTY_STEPS[kairos-raw]=1; DIRTY_STEPS[kairos-deploy-dd]=1 ;;
         esac
     done <<< "$changed"
 }
@@ -124,10 +141,17 @@ cascade_dirty() {
     local changed=true
     while [[ "$changed" == "true" ]]; do
         changed=false
-        if is_dirty "download-iso"   && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]];    then DIRTY_STEPS[bcm-prepare]=1;    changed=true; fi
-        if is_dirty "kairos-build"   && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]]; then DIRTY_STEPS[kairos-extract]=1;  changed=true; fi
-        if is_dirty "kairos-extract" && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]];  then DIRTY_STEPS[kairos-deploy]=1;   changed=true; fi
-        if is_dirty "kairos-deploy"  && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]];     then DIRTY_STEPS[kairos-run]=1;      changed=true; fi
+        # Common
+        if is_dirty "download-iso"     && [[ -z "${DIRTY_STEPS[bcm-prepare]:-}" ]];     then DIRTY_STEPS[bcm-prepare]=1;     changed=true; fi
+        # Option A cascade
+        if is_dirty "kairos-build"     && [[ -z "${DIRTY_STEPS[kairos-extract]:-}" ]];  then DIRTY_STEPS[kairos-extract]=1;   changed=true; fi
+        if is_dirty "kairos-extract"   && [[ -z "${DIRTY_STEPS[kairos-deploy]:-}" ]];   then DIRTY_STEPS[kairos-deploy]=1;    changed=true; fi
+        if is_dirty "kairos-deploy"    && [[ -z "${DIRTY_STEPS[kairos-run]:-}" ]];      then DIRTY_STEPS[kairos-run]=1;       changed=true; fi
+        # Option B cascade (either canvos or kairos-init can feed into kairos-raw)
+        if is_dirty "kairos-container" && [[ -z "${DIRTY_STEPS[kairos-raw]:-}" ]];      then DIRTY_STEPS[kairos-raw]=1;       changed=true; fi
+        if is_dirty "kairos-build"     && [[ -z "${DIRTY_STEPS[kairos-raw]:-}" ]];      then DIRTY_STEPS[kairos-raw]=1;       changed=true; fi
+        if is_dirty "kairos-raw"       && [[ -z "${DIRTY_STEPS[kairos-deploy-dd]:-}" ]];then DIRTY_STEPS[kairos-deploy-dd]=1; changed=true; fi
+        if is_dirty "kairos-deploy-dd" && [[ -z "${DIRTY_STEPS[kairos-run-dd]:-}" ]];   then DIRTY_STEPS[kairos-run-dd]=1;    changed=true; fi
     done
 }
 
@@ -184,14 +208,21 @@ can_skip() {
         kairos-extract)
             [[ -d "build/pxe" ]] && [[ -f "build/pxe/rootfs.squashfs" ]] && [[ -f "build/pxe/vmlinuz" ]] && [[ -f "build/pxe/user-data.yaml" ]]
             ;;
-        kairos-run)
+        # Option B skip detection
+        kairos-container)
+            [[ -f "build/kairos-container-image.ref" ]]
+            ;;
+        kairos-raw)
+            [[ -f "build/kairos-disk.raw" ]]
+            ;;
+        kairos-run|kairos-run-dd)
             # Skip if VM is already running and SSH-reachable via BCM
             if [[ -f "build/.kairos-qemu.pid" ]] && kill -0 "$(cat build/.kairos-qemu.pid 2>/dev/null)" 2>/dev/null; then
                 return 0
             fi
             return 1
             ;;
-        kairos-deploy|validate)
+        kairos-deploy|kairos-deploy-dd|validate)
             return 1
             ;;
         *)
@@ -405,6 +436,9 @@ JFROG_INSTANCE=$(jq -r '.jfrog_instance // "insightsoftmax.jfrog.io"' env.json 2
 JFROG_REPO=$(jq -r '.jfrog_repo // "iso-releases"' env.json 2>/dev/null || echo "iso-releases")
 JFROG_TOKEN=$(jq -r '.jfrog_token // empty' env.json 2>/dev/null || true)
 BCM_PASSWORD=$(jq -r '.bcm_password // empty' env.json 2>/dev/null || true)
+DEPLOY_METHOD=$(jq -r '.deploy_method // "option-a"' env.json 2>/dev/null || echo "option-a")
+# Option B container source: "canvos" (default, includes stylus-agent) or "kairos-init" (lighter, no Palette)
+CONTAINER_SOURCE=$(jq -r '.container_source // "canvos"' env.json 2>/dev/null || echo "canvos")
 
 # Get ISO metadata from JFrog (size + sha256) for skip detection and download progress
 ISO_TOTAL_MB=0
@@ -423,8 +457,16 @@ if [[ -n "$JFROG_TOKEN" ]]; then
     fi
 fi
 
-# All pipeline steps
-ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-extract" "kairos-deploy" "kairos-run" "validate")
+# All pipeline steps (conditional on deploy method)
+if [[ "$DEPLOY_METHOD" == "option-b" ]]; then
+    if [[ "$CONTAINER_SOURCE" == "canvos" ]]; then
+        ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-raw" "kairos-deploy-dd" "kairos-run-dd" "validate")
+    else
+        ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-container" "kairos-raw" "kairos-deploy-dd" "kairos-run-dd" "validate")
+    fi
+else
+    ALL_STEPS=("download-iso" "bcm-prepare" "bcm-run" "kairos-build" "kairos-extract" "kairos-deploy" "kairos-run" "validate")
+fi
 
 # ---- Initialize ----
 mkdir -p "$LOG_DIR" "$STATUS_DIR"
@@ -440,8 +482,13 @@ done
 for s in "${ALL_STEPS[@]}"; do
     set_status "$s" "pending"
 done
-set_status "kairos-deploy" "blocked"
-set_status "kairos-run" "blocked"
+if [[ "$DEPLOY_METHOD" == "option-b" ]]; then
+    set_status "kairos-deploy-dd" "blocked"
+    set_status "kairos-run-dd" "blocked"
+else
+    set_status "kairos-deploy" "blocked"
+    set_status "kairos-run" "blocked"
+fi
 set_status "validate" "blocked"
 
 # ════════════════════════════════════════════════
@@ -464,8 +511,13 @@ BCM_NEEDS_START=false
 if ! is_dirty "bcm-run" && [[ -f "build/bcm-disk.qcow2" ]]; then
     if ! can_skip "bcm-run"; then
         BCM_NEEDS_START=true
-        DIRTY_STEPS[kairos-deploy]=1
-        DIRTY_STEPS[kairos-run]=1
+        if [[ "$DEPLOY_METHOD" == "option-b" ]]; then
+            DIRTY_STEPS[kairos-deploy-dd]=1
+            DIRTY_STEPS[kairos-run-dd]=1
+        else
+            DIRTY_STEPS[kairos-deploy]=1
+            DIRTY_STEPS[kairos-run]=1
+        fi
     fi
 fi
 
@@ -514,6 +566,11 @@ for s in "${!DIRTY_STEPS[@]}"; do
             rm -f build/palette-edge-installer.iso ;;
         kairos-extract)
             rm -rf build/pxe/ ;;
+        kairos-container)
+            rm -rf build/kairos-container/ build/kairos-container-image.ref ;;
+        kairos-raw)
+            rm -f build/kairos-disk.raw build/kairos-disk.raw.sha256
+            rm -rf build/auroraboot/ ;;
     esac
 done
 fi
@@ -523,7 +580,15 @@ fi
 # ════════════════════════════════════════════════
 banner "Phase 1: Build (parallel)"
 echo -e "${YELLOW}Track A:${NC} download-iso → bcm-prepare → bcm-run"
-echo -e "${YELLOW}Track B:${NC} kairos-build → kairos-extract"
+if [[ "$DEPLOY_METHOD" == "option-b" ]]; then
+    if [[ "$CONTAINER_SOURCE" == "canvos" ]]; then
+        echo -e "${YELLOW}Track B:${NC} kairos-build (CanvOS) → kairos-raw (Option B)"
+    else
+        echo -e "${YELLOW}Track B:${NC} kairos-container (kairos-init) → kairos-raw (Option B)"
+    fi
+else
+    echo -e "${YELLOW}Track B:${NC} kairos-build → kairos-extract"
+fi
 echo ""
 
 # Track A (BCM) — sequential steps in a subshell
@@ -535,10 +600,24 @@ echo ""
 PIDS["track-a"]=$!
 
 # Track B (Kairos) — sequential steps in a subshell
-(
-    run_step "kairos-build" && \
-    run_step "kairos-extract"
-) &
+if [[ "$DEPLOY_METHOD" == "option-b" ]]; then
+    if [[ "$CONTAINER_SOURCE" == "canvos" ]]; then
+        (
+            run_step "kairos-build" && \
+            run_step "kairos-raw"
+        ) &
+    else
+        (
+            run_step "kairos-container" && \
+            run_step "kairos-raw"
+        ) &
+    fi
+else
+    (
+        run_step "kairos-build" && \
+        run_step "kairos-extract"
+    ) &
+fi
 PIDS["track-b"]=$!
 
 # Poll status while both tracks run
@@ -584,11 +663,19 @@ sleep 2
 # ════════════════════════════════════════════════
 banner "Phase 2: Deploy + Provision"
 
-# kairos-deploy (background, polled via show_status)
-run_step "kairos-deploy" &
-PIDS["kairos-deploy"]=$!
+# Deploy step (method-dependent)
+if [[ "$DEPLOY_METHOD" == "option-b" ]]; then
+    DEPLOY_STEP="kairos-deploy-dd"
+    RUN_STEP="kairos-run-dd"
+else
+    DEPLOY_STEP="kairos-deploy"
+    RUN_STEP="kairos-run"
+fi
 
-while kill -0 "${PIDS["kairos-deploy"]}" 2>/dev/null; do
+run_step "$DEPLOY_STEP" &
+PIDS["deploy"]=$!
+
+while kill -0 "${PIDS["deploy"]}" 2>/dev/null; do
     show_status "${ALL_STEPS[@]}"
     echo -e "\n  ${CYAN}(refreshing every 5s)${NC}"
     sleep 5
@@ -596,17 +683,17 @@ while kill -0 "${PIDS["kairos-deploy"]}" 2>/dev/null; do
     banner "Pipeline Status"
 done
 
-if ! wait "${PIDS["kairos-deploy"]}"; then
+if ! wait "${PIDS["deploy"]}"; then
     show_status "${ALL_STEPS[@]}"
-    echo -e "\n${RED}═══ kairos-deploy failed ═══${NC}"
+    echo -e "\n${RED}═══ ${DEPLOY_STEP} failed ═══${NC}"
     exit 1
 fi
 
-# kairos-run (background, polled via show_status)
-run_step "kairos-run" &
-PIDS["kairos-run"]=$!
+# Run step (method-dependent)
+run_step "$RUN_STEP" &
+PIDS["run"]=$!
 
-while kill -0 "${PIDS["kairos-run"]}" 2>/dev/null; do
+while kill -0 "${PIDS["run"]}" 2>/dev/null; do
     show_status "${ALL_STEPS[@]}"
     echo -e "\n  ${CYAN}(refreshing every 5s)${NC}"
     sleep 5
@@ -614,9 +701,9 @@ while kill -0 "${PIDS["kairos-run"]}" 2>/dev/null; do
     banner "Pipeline Status"
 done
 
-if ! wait "${PIDS["kairos-run"]}"; then
+if ! wait "${PIDS["run"]}"; then
     show_status "${ALL_STEPS[@]}"
-    echo -e "\n${RED}═══ kairos-run failed ═══${NC}"
+    echo -e "\n${RED}═══ ${RUN_STEP} failed ═══${NC}"
     exit 1
 fi
 
@@ -690,6 +777,12 @@ if [[ -f "build/compute-node-disk.qcow2" ]]; then
 fi
 if [[ -d "build/pxe" ]]; then
     echo "   PXE artifacts:    build/pxe/ ($(du -sh "build/pxe" | cut -f1))"
+fi
+if [[ -f "build/kairos-disk.raw" ]]; then
+    echo "   Kairos raw image: build/kairos-disk.raw ($(du -h "build/kairos-disk.raw" | cut -f1))"
+fi
+if [[ -f "build/kairos-container-image.ref" ]]; then
+    echo "   Container image:  $(cat build/kairos-container-image.ref)"
 fi
 echo ""
 

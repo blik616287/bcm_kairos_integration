@@ -1,0 +1,16 @@
+[Unit]
+Description=Install Kairos Raw Disk Image
+After=network-online.target
+Wants=network-online.target
+After=NetworkManager-wait-online.service systemd-networkd-wait-online.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -c 'echo "kairos-install: waiting 10s for network settle..."; sleep 10'
+ExecStart=/usr/local/sbin/install-kairos.sh
+TimeoutStartSec=1800
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

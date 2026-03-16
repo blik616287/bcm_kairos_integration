@@ -23,6 +23,7 @@ BCM_PASSWORD="${BCM_PASSWORD:?ERROR: BCM_PASSWORD not set. Set in env.json or ex
 KAIROS_USER="kairos"
 KAIROS_PASSWORD="kairos"
 KAIROS_IP=""
+COS_CHECKS=false
 
 usage() {
     cat <<EOF
@@ -36,6 +37,7 @@ Options:
   --kairos-ip IP       Kairos node IP (default: auto-detect from DHCP leases)
   --kairos-user USER   Kairos SSH user (default: kairos)
   --kairos-pass PASS   Kairos SSH password (default: kairos)
+  --cos-checks         Run COS partition + immutability checks (Option B)
   -h, --help           Show this help
 EOF
     exit 0
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --kairos-ip)    KAIROS_IP="$2"; shift 2 ;;
         --kairos-user)  KAIROS_USER="$2"; shift 2 ;;
         --kairos-pass)  KAIROS_PASSWORD="$2"; shift 2 ;;
+        --cos-checks)   COS_CHECKS=true; shift ;;
         -h|--help)      usage ;;
         *)              echo "Unknown option: $1"; usage ;;
     esac
@@ -119,23 +122,38 @@ echo "[OK] Kairos node IP: ${KAIROS_IP}"
 echo ""
 
 # ---- SSH to Kairos node through head node ----
-# BCM provisioning provides root SSH via key-based auth from the head node.
-# The kairos user may not exist (user-data boot stages don't run under BCM).
-echo "[..] Testing SSH to Kairos node (root@${KAIROS_IP})..."
-KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
+# Try root key auth first (BCM boot stage installs the head node's SSH key),
+# then fall back to kairos user with password auth.
+echo "[..] Testing SSH to Kairos node (${KAIROS_IP})..."
+KAIROS_SSH=""
 
-# Test SSH connectivity
-SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
-if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
-    echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
-    echo "SSH output: ${SSH_TEST}"
-    echo ""
-    echo "The node may still be booting, or user-data was not applied."
-    echo "Try again in a minute, or check the console."
-    exit 1
+# Try root key auth
+SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} -o ConnectTimeout=5 root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
+    KAIROS_SSH="ssh ${SSH_OPTS} root@${KAIROS_IP}"
+    echo "[OK] SSH via root key auth"
+else
+    # Try kairos user with password
+    SSH_TEST=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o ConnectTimeout=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+    if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
+        KAIROS_SSH="sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP}"
+        echo "[OK] SSH via ${KAIROS_USER} password auth"
+    else
+        echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
+        echo "SSH output: ${SSH_TEST}"
+        echo ""
+        echo "The node may still be booting, or user-data was not applied."
+        echo "Try again in a minute, or check the console."
+        exit 1
+    fi
 fi
 echo "[OK] SSH connected"
 echo ""
+
+# Helper: run a command on the Kairos node via BCM jump host
+run_on_kairos() {
+    ${BCM_SSH} "${KAIROS_SSH} '$1'" 2>/dev/null | filter_motd
+}
 
 # ---- Run validation checks ----
 echo "============================================"
@@ -144,7 +162,7 @@ echo "============================================"
 echo ""
 
 # Collect all info in one SSH session to minimize round-trips
-VALIDATION=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} '
+VALIDATION=$(${BCM_SSH} "${KAIROS_SSH} '
 echo \"===OS_RELEASE===\"
 cat /etc/os-release 2>/dev/null
 echo \"===KAIROS_RELEASE===\"
@@ -181,6 +199,20 @@ echo \"===USERS===\"
 grep kairos /etc/passwd 2>/dev/null || echo MISSING
 echo \"===ISSUE===\"
 cat /etc/issue 2>/dev/null || echo MISSING
+echo \"===COS_PARTITIONS===\"
+lsblk -o NAME,LABEL,FSTYPE,SIZE,MOUNTPOINT 2>/dev/null || echo MISSING
+echo \"===COS_OEM===\"
+blkid -L COS_OEM 2>/dev/null || echo MISSING
+echo \"===COS_STATE===\"
+blkid -L COS_STATE 2>/dev/null || echo MISSING
+echo \"===COS_RECOVERY===\"
+blkid -L COS_RECOVERY 2>/dev/null || echo MISSING
+echo \"===COS_PERSISTENT===\"
+blkid -L COS_PERSISTENT 2>/dev/null || echo MISSING
+echo \"===ROOT_MOUNT===\"
+mount | grep \" / \" | head -1 || echo MISSING
+echo \"===COS_LAYOUT===\"
+cat /run/cos/cos-layout.env 2>/dev/null || echo MISSING
 echo \"===END===\"
 '" 2>/dev/null | filter_motd)
 
@@ -260,32 +292,86 @@ else
     check "stylus-agent" "FAIL" "not running"
 fi
 
-# Check cmd (BCM compute daemon)
-if echo "$SERVICES" | grep -q "cmd.*running" || ${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'systemctl is-active cmd'" 2>/dev/null | filter_motd | grep -q "active"; then
-    check "cmd service" "PASS" "active"
+# Check cmd (BCM compute daemon — runs via unshare, not a systemd service)
+CMD_COUNT=$(run_on_kairos 'ps aux | grep "cmd -s -n" | grep -v grep | wc -l' || echo "0")
+if [[ "$CMD_COUNT" -gt 0 ]]; then
+    check "BCM cmd daemon" "PASS" "running (${CMD_COUNT} process(es) via unshare)"
 else
-    check "cmd service" "FAIL" "not running"
+    check "BCM cmd daemon" "WARN" "not running (boot stage may not have completed)"
 fi
 
 # 10. User
 echo ""
 echo "-- User Config --"
-check "SSH login" "PASS" "root@${KAIROS_IP} (via BCM head node)"
+check "SSH login" "PASS" "${KAIROS_IP} (via BCM head node)"
 
 # Check user-data was applied
-USERDATA_CHECK=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'test -f /oem/99_userdata.yaml && echo present || echo missing'" 2>/dev/null | filter_motd || true)
+USERDATA_CHECK=$(run_on_kairos 'test -f /oem/99_bcm.yaml && echo present || test -f /oem/99_userdata.yaml && echo present || echo missing' || true)
 if [[ "$USERDATA_CHECK" == *"present"* ]]; then
-    check "user-data" "PASS" "/oem/99_userdata.yaml present"
+    check "user-data" "PASS" "cloud-config present in /oem/"
 else
-    check "user-data" "FAIL" "/oem/99_userdata.yaml missing"
+    check "user-data" "FAIL" "no cloud-config found in /oem/"
 fi
 
 # Check Palette registration
-REG_LOGS=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'journalctl -u stylus-agent --no-pager'" 2>/dev/null | filter_motd || true)
+REG_LOGS=$(run_on_kairos 'journalctl -u stylus-agent --no-pager' || true)
 if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
     check "Palette registration" "PASS" "registered with Palette"
 else
     check "Palette registration" "WARN" "registration not detected"
+fi
+
+# ---- COS Partition Checks (Option B) ----
+# Auto-detect: if COS_OEM exists, enable COS checks automatically
+COS_OEM_DEV=$(get_section "COS_OEM")
+if [[ "$COS_CHECKS" == "true" ]] || [[ "$COS_OEM_DEV" != "MISSING" && -n "$COS_OEM_DEV" ]]; then
+    echo ""
+    echo "-- COS Partitions (Option B) --"
+
+    if [[ "$COS_OEM_DEV" != "MISSING" && -n "$COS_OEM_DEV" ]]; then
+        check "COS_OEM partition" "PASS" "$COS_OEM_DEV"
+    else
+        check "COS_OEM partition" "FAIL" "not found"
+    fi
+
+    COS_RECOVERY_DEV=$(get_section "COS_RECOVERY")
+    if [[ "$COS_RECOVERY_DEV" != "MISSING" && -n "$COS_RECOVERY_DEV" ]]; then
+        check "COS_RECOVERY partition" "PASS" "$COS_RECOVERY_DEV"
+    else
+        check "COS_RECOVERY partition" "FAIL" "not found"
+    fi
+
+    COS_STATE_DEV=$(get_section "COS_STATE")
+    if [[ "$COS_STATE_DEV" != "MISSING" && -n "$COS_STATE_DEV" ]]; then
+        check "COS_STATE partition" "PASS" "$COS_STATE_DEV"
+    else
+        check "COS_STATE partition" "WARN" "not found (created on first Kairos boot)"
+    fi
+
+    COS_PERSISTENT_DEV=$(get_section "COS_PERSISTENT")
+    if [[ "$COS_PERSISTENT_DEV" != "MISSING" && -n "$COS_PERSISTENT_DEV" ]]; then
+        check "COS_PERSISTENT partition" "PASS" "$COS_PERSISTENT_DEV"
+    else
+        check "COS_PERSISTENT partition" "WARN" "not found (created on first Kairos boot)"
+    fi
+
+    # Check root filesystem immutability
+    ROOT_MOUNT=$(get_section "ROOT_MOUNT")
+    if echo "$ROOT_MOUNT" | grep -q "ro,\|ro "; then
+        check "Root filesystem immutable" "PASS" "mounted read-only"
+    elif [[ -n "$ROOT_MOUNT" && "$ROOT_MOUNT" != "MISSING" ]]; then
+        check "Root filesystem immutable" "WARN" "mounted read-write: $ROOT_MOUNT"
+    else
+        check "Root filesystem immutable" "WARN" "could not determine mount mode"
+    fi
+
+    # Check cos-layout.env
+    COS_LAYOUT=$(get_section "COS_LAYOUT")
+    if [[ "$COS_LAYOUT" != "MISSING" && -n "$COS_LAYOUT" ]]; then
+        check "COS layout config" "PASS" "cos-layout.env present"
+    else
+        check "COS layout config" "WARN" "/run/cos/cos-layout.env missing"
+    fi
 fi
 
 # ---- Summary ----

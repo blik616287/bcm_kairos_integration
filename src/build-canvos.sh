@@ -132,12 +132,28 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 
     # Patch Earthfile to add BCM-required packages
     # wget: BCM's wait_cmd uses it to health-check the cmd daemon
-    # initramfs-tools: BCM needs it to generate node ramdisks
     # ifupdown: BCM removes NetworkManager and masks systemd-networkd; needs ifupdown for networking
+    # nfs-common: NFS client for mounting BCM default-image rootfs
     if ! grep -q 'wget' "${CANVOS_DIR}/Earthfile"; then
-        echo "Patching Earthfile: adding wget, initramfs-tools, ifupdown..."
-        sed -i 's/apt-get install --no-install-recommends kbd/apt-get install --no-install-recommends wget initramfs-tools ifupdown kbd/' \
+        echo "Patching Earthfile: adding wget, ifupdown, nfs-common..."
+        sed -i 's/apt-get install --no-install-recommends kbd/apt-get install --no-install-recommends wget ifupdown nfs-common kbd/' \
             "${CANVOS_DIR}/Earthfile"
+    fi
+
+    # Skip dracut nfit module (libnvdimm not available for all kernels)
+    if ! grep -q 'skip-nfit' "${CANVOS_DIR}/Earthfile"; then
+        echo "Patching Earthfile: skipping dracut nfit module..."
+        sed -i '/IF \[ "\$FIPS_ENABLED" = "false" \]/a\                RUN echo '"'"'omit_dracutmodules+=" nfit "'"'"' > /etc/dracut.conf.d/99-skip-nfit.conf' \
+            "${CANVOS_DIR}/Earthfile"
+    fi
+
+    # Add custom scripts via the Dockerfile's documented customization point (line 31).
+    # Scripts go in /usr/bin/ (NOT /usr/local/bin/) because Kairos mounts COS_PERSISTENT
+    # over /usr/local at boot, hiding any files baked into the immutable root at that path.
+    if ! grep -q 'bcm-compat-fixes' "${CANVOS_DIR}/Dockerfile"; then
+        echo "Patching Dockerfile: adding custom BCM scripts..."
+        sed -i '/Add any other image customizations here/a\COPY overlay/files/usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-compat-fixes.sh\nCOPY overlay/files/usr/bin/bcm-sync-userdata.sh /usr/bin/bcm-sync-userdata.sh\nRUN chmod +x /usr/bin/bcm-*.sh' \
+            "${CANVOS_DIR}/Dockerfile"
     fi
 
     echo "[1/2] Running CanvOS build (this may take a while)..."
@@ -163,12 +179,29 @@ cp "${ISO_FILE}" "${BUILD_DIR}/"
 
 ISO_SIZE=$(du -h "${BUILD_DIR}/${ISO_NAME}.iso" | cut -f1)
 
+# ---- Write container image ref (for Option B raw image generation) ----
+# CanvOS pushes the provider image as $IMAGE_REGISTRY/$IMAGE_REPO:$K8S_DIST-$K8S_VERSION-$IMAGE_TAG
+# Detect the most recent CanvOS image from docker
+CANVOS_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+    | grep "^${IMAGE_REGISTRY}/${OS_DISTRIBUTION}:" \
+    | grep "${CUSTOM_TAG}" \
+    | head -1 || true)
+
+if [[ -n "$CANVOS_IMAGE" ]]; then
+    echo "${CANVOS_IMAGE}" > "${BUILD_DIR}/kairos-container-image.ref"
+    echo " Container: ${CANVOS_IMAGE} (saved to kairos-container-image.ref)"
+else
+    echo " [WARN] Could not detect CanvOS container image for Option B"
+fi
+
 echo ""
 echo "============================================"
 echo " Build complete!"
 echo "============================================"
 echo " ${BUILD_DIR}/${ISO_NAME}.iso (${ISO_SIZE})"
 [[ -f "${BUILD_DIR}/${ISO_NAME}.iso.sha256" ]] && echo " ${BUILD_DIR}/${ISO_NAME}.iso.sha256"
+[[ -n "${CANVOS_IMAGE:-}" ]] && echo " Container: ${CANVOS_IMAGE} (for Option B)"
 echo ""
-echo " Next: ./extract-kairos-pxe.sh"
+echo " Next (Option A): ./extract-kairos-pxe.sh"
+echo " Next (Option B): ./generate-raw-image.sh"
 echo "============================================"
