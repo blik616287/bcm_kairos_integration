@@ -241,6 +241,9 @@ kairos-stop: ## Kill running Kairos compute node VM
 	@if [ -f build/.kairos-qemu.pid ] && kill $$(cat build/.kairos-qemu.pid) 2>/dev/null; then \
 		rm -f build/.kairos-qemu.pid; \
 		echo "Kairos VM stopped."; \
+	elif pkill -f "qemu-system.*Kairos-ComputeNode" 2>/dev/null; then \
+		rm -f build/.kairos-qemu.pid; \
+		echo "Kairos VM stopped (by name)."; \
 	else \
 		rm -f build/.kairos-qemu.pid; \
 		echo "No Kairos VM running."; \
