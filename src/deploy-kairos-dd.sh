@@ -430,45 +430,64 @@ for tmpl in /tftpboot/pxelinux.cfg/template /tftpboot/x86_64/bios/pxelinux.cfg/t
 done
 TEMPLATE_PATCH
 
-    # Step 6: Configure node001 with the installer image
-    echo "[6/7] Configuring node001..."
-    ${SSH_CMD} << CONFIGURE_NODE | filter_motd
-# Ensure the kernel referenced by the cloned image actually exists in the image filesystem.
-# The cloned default-image may reference a kernel that is in the base image. We find the
-# actual kernel in the installer image and update the softwareimage's kernelVersion.
+    # Step 6: Fix installer image kernel + configure kairos category
+    echo "[6/7] Configuring BCM for Kairos deployment..."
+
+    # Fix kernel version: the cloned image may reference a kernel from default-image
+    # that doesn't exist in the installer filesystem. Find the actual kernel and update.
+    ${SSH_CMD} << 'KERNEL_FIX' | filter_motd
 IMAGE_ROOT="/cm/images/kairos-installer"
-ACTUAL_KERNEL=\$(ls "\${IMAGE_ROOT}/boot/vmlinuz-"* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')
-if [[ -n "\$ACTUAL_KERNEL" ]]; then
-    echo "Found kernel in installer image: \${ACTUAL_KERNEL}"
-    cmsh -c "softwareimage; use kairos-installer; set kernelversion \${ACTUAL_KERNEL}; commit" 2>&1 || true
+ACTUAL_KERNEL=$(ls "${IMAGE_ROOT}/boot/vmlinuz-"* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')
+if [ -n "$ACTUAL_KERNEL" ]; then
+    echo "Found kernel: ${ACTUAL_KERNEL}"
+    # Ensure kernel modules dir exists (BCM validates this)
+    if [ ! -d "${IMAGE_ROOT}/lib/modules/${ACTUAL_KERNEL}" ]; then
+        mkdir -p "${IMAGE_ROOT}/lib/modules/${ACTUAL_KERNEL}"
+    fi
+    cmsh -c "softwareimage; use kairos-installer; set kernelversion ${ACTUAL_KERNEL}; commit" 2>&1 || true
 fi
+KERNEL_FIX
 
-# Now configure node001
-cmsh << 'CMSHEOF'
-device
-use node001
-set mac ${COMPUTE_MAC}
-set installmode FULL
-set softwareimage kairos-installer
-set kernelparameters "console=tty0 console=ttyS0,115200n8"
-commit
-CMSHEOF
-echo "[OK] node001: MAC=${COMPUTE_MAC}, installmode=FULL, image=kairos-installer"
-CONFIGURE_NODE
+    # Configure the kairos category:
+    # - Clone from default if it doesn't exist
+    # - Set softwareimage and installmode so any node in this category auto-deploys Kairos
+    # - Disable irrelevant health checks (interfaces, mounts, ntp)
+    # - Set as the default category for new physical nodes
+    ${SSH_CMD} << 'CATEGORY_SETUP' | filter_motd
+# Create kairos category if it doesn't exist
+cmsh -c "category; list" 2>/dev/null | grep -q kairos || \
+    cmsh -c "category; clone default kairos; commit" 2>/dev/null
 
-    # Step 7: Generate ramdisks
-    echo "[7/7] Waiting for ramdisk generation..."
+# Configure kairos category with installer image and install mode
+cmsh -c "category; use kairos; set softwareimage kairos-installer; set installmode FULL; set kernelparameters 'console=tty0 console=ttyS0,115200n8'; commit" 2>&1 || true
+
+# Disable health checks that don't apply to Kairos nodes
+cmsh -c "category; use kairos; monitoring; setup; healthconf; use interfaces; set disabled yes; commit" 2>&1 || true
+cmsh -c "category; use kairos; monitoring; setup; healthconf; use mounts; set disabled yes; commit" 2>&1 || true
+cmsh -c "category; use kairos; monitoring; setup; healthconf; use ntp; set disabled yes; commit" 2>&1 || true
+
+# Set kairos as the default category for new physical nodes
+cmsh -c "partition; use base; set defaultcategory kairos; commit" 2>&1 || true
+
+echo "[OK] kairos category configured (softwareimage=kairos-installer, installmode=FULL)"
+echo "[OK] Default category for new nodes set to kairos"
+CATEGORY_SETUP
+
+    # Configure the test VM node (node001) with the compute MAC and kairos category
+    ${SSH_CMD} "cmsh -c 'device; use node001; set mac ${COMPUTE_MAC}; set category kairos; commit'" 2>/dev/null | filter_motd || true
+    echo "[OK] node001: MAC=${COMPUTE_MAC}, category=kairos"
+
+    # Step 7: Generate ramdisk for the installer image (shared by all nodes in kairos category)
+    echo "[7/7] Generating ramdisk for kairos-installer image..."
     ${SSH_CMD} << 'WAIT_RAMDISK' | filter_motd
-# Generate ramdisks for the installer image
 cmsh -c "softwareimage; use kairos-installer; createramdisk" 2>&1 || true
 sleep 15
-cmsh -c "device; use node001; createramdisk" 2>&1 || true
-sleep 15
-echo "[OK] Ramdisks generated"
+echo "[OK] Ramdisk generated (shared by all kairos-category nodes)"
 WAIT_RAMDISK
 
     echo ""
-    echo "[OK] BCM configured to provision installer image on node001"
+    echo "[OK] BCM configured for Kairos deployment"
+    echo "     Any new node added to the 'kairos' category will PXE boot the Kairos installer"
 fi
 
 if [[ "$NO_LAUNCH" == "true" ]]; then
@@ -610,11 +629,14 @@ while true; do
         exit 1
     fi
 
-    # Get node IP from DHCP leases by MAC address (no node name dependency)
-    KAIROS_IP=$(${SSH_CMD} "awk '/$(echo ${COMPUTE_MAC} | tr ':' ':')/{found=1} found && /lease /{print \$2; exit}' /var/lib/dhcpd/dhcpd.leases 2>/dev/null" 2>/dev/null | filter_motd || true)
+    # Get node IP by MAC: search DHCP leases (most recent lease for this MAC)
+    KAIROS_IP=$(${SSH_CMD} "grep -B5 '${COMPUTE_MAC}' /var/lib/dhcpd/dhcpd.leases 2>/dev/null | grep '^lease' | tail -1 | awk '{print \$2}'" 2>/dev/null | filter_motd || true)
     if [[ -z "$KAIROS_IP" ]]; then
-        # Fallback: get IP from cmsh device list by MAC
-        KAIROS_IP=$(${SSH_CMD} "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${COMPUTE_MAC}' | grep -oP '10\.\d+\.\d+\.\d+'" 2>/dev/null | filter_motd || true)
+        # Fallback: get IP from cmsh (use get ip on the device found by MAC)
+        bcm_node=$(${SSH_CMD} "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${COMPUTE_MAC}' | awk '{print \$2}'" 2>/dev/null | filter_motd || true)
+        if [[ -n "$bcm_node" ]]; then
+            KAIROS_IP=$(${SSH_CMD} "cmsh -c 'device; use ${bcm_node}; get ip' 2>/dev/null" 2>/dev/null | filter_motd | grep -oP '10\.\d+\.\d+\.\d+' || true)
+        fi
     fi
 
     if [[ -n "$KAIROS_IP" ]]; then
