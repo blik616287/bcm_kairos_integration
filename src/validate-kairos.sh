@@ -122,20 +122,30 @@ echo "[OK] Kairos node IP: ${KAIROS_IP}"
 echo ""
 
 # ---- SSH to Kairos node through head node ----
-# BCM provisioning provides root SSH via key-based auth from the head node.
-# The kairos user may not exist (user-data boot stages don't run under BCM).
-echo "[..] Testing SSH to Kairos node (root@${KAIROS_IP})..."
-KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
+# Try root key auth first (BCM boot stage installs the head node's SSH key),
+# then fall back to kairos user with password auth.
+echo "[..] Testing SSH to Kairos node (${KAIROS_IP})..."
+KAIROS_SSH=""
 
-# Test SSH connectivity
-SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
-if [[ "$SSH_TEST" != *"CONNECTED"* ]]; then
-    echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
-    echo "SSH output: ${SSH_TEST}"
-    echo ""
-    echo "The node may still be booting, or user-data was not applied."
-    echo "Try again in a minute, or check the console."
-    exit 1
+# Try root key auth
+SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} -o ConnectTimeout=5 root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
+    KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
+    echo "[OK] SSH via root key auth"
+else
+    # Try kairos user with password
+    SSH_TEST=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o ConnectTimeout=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+    if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
+        KAIROS_SSH="${BCM_SSH} \"sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP}\""
+        echo "[OK] SSH via ${KAIROS_USER} password auth"
+    else
+        echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
+        echo "SSH output: ${SSH_TEST}"
+        echo ""
+        echo "The node may still be booting, or user-data was not applied."
+        echo "Try again in a minute, or check the console."
+        exit 1
+    fi
 fi
 echo "[OK] SSH connected"
 echo ""

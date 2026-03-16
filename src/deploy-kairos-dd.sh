@@ -717,28 +717,15 @@ if [[ "$kairos_booted" == "true" ]]; then
         echo "[WARN] Root filesystem is NOT read-only"
     fi
 
-    # Wait for Palette registration
-    echo "[..] Waiting for Palette registration..."
-    reg_elapsed=0
-    reg_timeout=300
-    while true; do
-        REG_LOGS=$(kairos_ssh "journalctl -u stylus-agent --no-pager -n 50" 2>/dev/null || true)
-        if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
-            echo ""
-            echo "[OK] stylus-agent registered with Palette"
-            break
-        fi
-        reg_elapsed=$((reg_elapsed + 10))
-        if [[ $reg_elapsed -ge $reg_timeout ]]; then
-            echo ""
-            echo "[WARN] Palette registration not detected after ${reg_timeout}s"
-            break
-        fi
-        printf "\r  [%dm%02ds] Waiting for registration..." $((reg_elapsed / 60)) $((reg_elapsed % 60))
-        sleep 10
-    done
+    # Check Palette registration (non-blocking)
+    REG_LOGS=$(kairos_ssh "journalctl -u stylus-agent --no-pager -n 50" 2>/dev/null || true)
+    if echo "$REG_LOGS" | grep -q "registering edge host device with hubble"; then
+        echo "[OK] stylus-agent registered with Palette"
+    else
+        echo "[INFO] Palette registration pending (stylus-agent will register in background)"
+    fi
 
-    total_elapsed=$((elapsed + dd_elapsed + reg_elapsed))
+    total_elapsed=$((elapsed + dd_elapsed))
     echo ""
     echo "[OK] Kairos compute node deployed with COS partitions (total: ${total_elapsed}s)"
 fi
