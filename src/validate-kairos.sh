@@ -130,13 +130,13 @@ KAIROS_SSH=""
 # Try root key auth
 SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} -o ConnectTimeout=5 root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
 if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
-    KAIROS_SSH="${BCM_SSH} \"ssh ${SSH_OPTS} root@${KAIROS_IP}\""
+    KAIROS_SSH="ssh ${SSH_OPTS} root@${KAIROS_IP}"
     echo "[OK] SSH via root key auth"
 else
     # Try kairos user with password
     SSH_TEST=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o ConnectTimeout=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
     if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
-        KAIROS_SSH="${BCM_SSH} \"sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP}\""
+        KAIROS_SSH="sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP}"
         echo "[OK] SSH via ${KAIROS_USER} password auth"
     else
         echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
@@ -150,9 +150,9 @@ fi
 echo "[OK] SSH connected"
 echo ""
 
-# Helper: run a command on the Kairos node using the detected auth method
+# Helper: run a command on the Kairos node via BCM jump host
 run_on_kairos() {
-    eval ${KAIROS_SSH} "'$1'" 2>/dev/null | filter_motd
+    ${BCM_SSH} "${KAIROS_SSH} '$1'" 2>/dev/null | filter_motd
 }
 
 # ---- Run validation checks ----
