@@ -249,7 +249,7 @@ stages:
       users:
         kairos:
           passwd: kairos
-    - name: "Enable SSH password auth"
+    - name: "Enable SSH password auth + disable fail2ban"
       files:
         - path: /etc/ssh/sshd_config.d/99-kairos-test.conf
           content: |
@@ -258,6 +258,7 @@ stages:
           permissions: 0644
       commands:
         - systemctl restart sshd || systemctl restart ssh || true
+        - systemctl disable --now fail2ban 2>/dev/null || true
 ${BCM_STAGES}
 CLOUDCONFIG
 

@@ -127,25 +127,33 @@ echo ""
 echo "[..] Testing SSH to Kairos node (${KAIROS_IP})..."
 KAIROS_SSH=""
 
-# Try root key auth
-SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} -o ConnectTimeout=5 root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
-if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
-    KAIROS_SSH="ssh ${SSH_OPTS} root@${KAIROS_IP}"
-    echo "[OK] SSH via root key auth"
-else
+# Retry SSH for up to 120s — the node may still be booting
+for attempt in $(seq 1 12); do
+    # Try root key auth
+    SSH_TEST=$(${BCM_SSH} "ssh ${SSH_OPTS} -o ConnectTimeout=5 root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+    if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
+        KAIROS_SSH="ssh ${SSH_OPTS} root@${KAIROS_IP}"
+        echo "[OK] SSH via root key auth"
+        break
+    fi
     # Try kairos user with password
     SSH_TEST=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o ConnectTimeout=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
     if [[ "$SSH_TEST" == *"CONNECTED"* ]]; then
         KAIROS_SSH="sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP}"
         echo "[OK] SSH via ${KAIROS_USER} password auth"
-    else
-        echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP}"
-        echo "SSH output: ${SSH_TEST}"
-        echo ""
-        echo "The node may still be booting, or user-data was not applied."
-        echo "Try again in a minute, or check the console."
-        exit 1
+        break
     fi
+    if [[ $attempt -lt 12 ]]; then
+        printf "\r  [%ds] Waiting for SSH..." $((attempt * 10))
+        sleep 10
+    fi
+done
+
+if [[ -z "$KAIROS_SSH" ]]; then
+    echo ""
+    echo "ERROR: Cannot SSH to Kairos node at ${KAIROS_IP} after 120s"
+    echo "SSH output: ${SSH_TEST}"
+    exit 1
 fi
 echo "[OK] SSH connected"
 echo ""
