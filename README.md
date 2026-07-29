@@ -464,3 +464,7 @@ The compute node gets a DHCP address from BCM on the 10.141.0.0/16 internal netw
 - **Palette rate limiting**: If `stylus-agent` starts without `/run/stylus/userdata`, it skips registration and hammers the login endpoint, triggering 429 rate limits that persist for 10+ minutes. The `bcm-sync-userdata.sh` ExecStartPre script prevents this by seeding the userdata file before the agent starts.
 - **Direct kernel boot reboot**: QEMU with `-kernel`/`-initrd` always re-enters the installer on VM reboot. `launch-bcm-kvm.sh --auto` handles this automatically by stopping and relaunching from disk.
 - **Partition sizing**: The Kairos installer may double some partition sizes internally. Ensure the compute node disk is large enough (default: 80G).
+
+## License
+
+[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
